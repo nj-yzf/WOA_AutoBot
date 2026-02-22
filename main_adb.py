@@ -7,7 +7,7 @@ import sys
 import os
 import gc
 import traceback
-from adb_controller import AdbController
+from adb_controller import AdbController, woa_debug_set_runtime_started, save_image_safe, read_image_safe
 
 
 def get_resource_path(relative_path):
@@ -179,6 +179,7 @@ class WoaBot:
         self.enable_random_task = False
         self.control_method = "minitouch"
         self.screenshot_method = "nemu_ipc"
+        self.mumu_path = ""
 
         self.slide_min_duration = 250
         self.slide_max_duration = 500
@@ -226,6 +227,9 @@ class WoaBot:
         self.ICON_ROIS = {
             'cross_runway.png': self.REGION_BOTTOM_ROI,
             'get_award_1.png': self.REGION_BOTTOM_ROI,
+            'get_award_2.png': self.REGION_REWARD_RECOVERY,
+            'get_award_3.png': self.REGION_REWARD_RECOVERY,
+            'get_award_4.png': self.REGION_REWARD_RECOVERY,
             'landing_permitted.png': self.REGION_BOTTOM_ROI,
             'landing_prohibited.png': self.REGION_BOTTOM_ROI,
             'push_back.png': self.REGION_BOTTOM_ROI,
@@ -253,7 +257,7 @@ class WoaBot:
         for tf in task_files:
             p = self.icon_path + tf
             if os.path.exists(p):
-                self.task_templates[tf] = cv2.imread(p)
+                self.task_templates[tf] = read_image_safe(p)
 
     def set_random_task_mode(self, enabled, log_change=True):
         if self.enable_random_task == enabled:
@@ -408,8 +412,8 @@ class WoaBot:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             p_n = os.path.join(debug_dir, f"mismatch_nemu_{ts}.png")
             p_a = os.path.join(debug_dir, f"mismatch_adb_{ts}.png")
-            cv2.imwrite(p_n, nemu_img)
-            cv2.imwrite(p_a, adb_img)
+            save_image_safe(p_n, nemu_img)
+            save_image_safe(p_a, adb_img)
             self.log(f"📋 [调试] 已保存对比图: {p_n} / {p_a}")
         except Exception as e:
             self.log(f"📋 [调试] 保存对比图失败: {e}")
@@ -423,15 +427,32 @@ class WoaBot:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             p_d = os.path.join(debug_dir, f"mismatch_droidcast_{ts}.png")
             p_a = os.path.join(debug_dir, f"mismatch_adb_{ts}.png")
-            cv2.imwrite(p_d, droidcast_img)
-            cv2.imwrite(p_a, adb_img)
+            save_image_safe(p_d, droidcast_img)
+            save_image_safe(p_a, adb_img)
             self.log(f"📋 [调试] 已保存对比图: {p_d} / {p_a}")
         except Exception as e:
             self.log(f"📋 [调试] 保存对比图失败: {e}")
 
+    def _save_list_roi_debug(self, full_screen, list_roi_img, lx, ly, lw, lh):
+        """任务列表检测为 0 时保存调试图（WOA_DEBUG=1 或 LIST_DETECT_DEBUG=1）"""
+        try:
+            base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+            debug_dir = os.path.join(base, "list_detect_debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            p_full = os.path.join(debug_dir, f"list_debug_full_{ts}.png")
+            p_roi = os.path.join(debug_dir, f"list_debug_roi_{ts}.png")
+            # 兼容中文路径的保存方式
+            save_image_safe(p_full, full_screen)
+            save_image_safe(p_roi, list_roi_img)
+            self.log(f"📋 [调试] 任务列表调试图已保存至: {debug_dir}")
+        except Exception as e:
+            self.log(f"📋 [调试] 保存 list_detect 截图失败: {e}")
+
     def _run_pending_detection(self, list_roi_img):
-        """按行识别：每行只保留该行内置信度最高的类型，避免跨行竞争导致相似图标误判。"""
-        task_defs = [
+        """按行识别：每行只保留该行内置信度最高的类型，避免跨行竞争导致相似图标误判。
+        环境变量 LIST_DETECT_CONF：覆盖置信度阈值（如 0.7），Vulkan 渲染可尝试降低。"""
+        base_defs = [
             ('pending_ice.png', self.handle_ice_task, 0.8, 'ice'),
             ('pending_repair.png', self.handle_repair_task, 0.8, 'repair'),
             ('pending_doing.png', self.handle_vehicle_check_task, 0.85, 'doing'),
@@ -440,6 +461,11 @@ class WoaBot:
             ('pending_takeoff.png', self.handle_takeoff_task, 0.8, 'takeoff'),
             ('pending_stand.png', self.handle_stand_task, 0.8, 'stand')
         ]
+        try:
+            conf_override = float(os.environ.get("LIST_DETECT_CONF", "0"))
+        except ValueError:
+            conf_override = 0
+        task_defs = [(n, h, conf_override if conf_override > 0 else c, t) for n, h, c, t in base_defs]
         ROW_HEIGHT = 24
 
         all_matches = []
@@ -603,6 +629,11 @@ class WoaBot:
         if self.screenshot_method != m:
             self.screenshot_method = m
 
+    def set_mumu_path(self, path):
+        self.mumu_path = (path or "").strip()
+        if self.adb:
+            self.adb.set_mumu_path(self.mumu_path)
+
     def log(self, message):
         if not message or not str(message).strip():
             return
@@ -692,6 +723,7 @@ class WoaBot:
             self.config_callback("auto_delay_count", 0)
         # 初始化计数器
         self.consecutive_timeout_count = 0
+        self.consecutive_errors = 0
         self.last_recovery_time = 0
 
         if not self.target_device:
@@ -705,6 +737,11 @@ class WoaBot:
                 control_method=self.control_method,
                 screenshot_method=self.screenshot_method,
             )
+            self.adb.set_mumu_path(self.mumu_path)
+            if self.config_callback:
+                self.adb.set_nemu_folder_callback(
+                    lambda folder: self.config_callback("mumu_path", folder)
+                )
             self.adb.set_thinking_strategy(*self.thinking_range)
             self.ocr = SimpleOCR(self.adb, self.icon_path)
             self.log("✅ OCR 模块已加载")
@@ -733,6 +770,16 @@ class WoaBot:
             ctrl = ctrl_map.get(self.adb.control_method, "ADB")
             shot = self.adb.screenshot_method if self.adb.screenshot_method != "adb" else "ADB"
             self.log(f">>> [模式] 触控: {ctrl}, 截图: {shot}")
+            if os.environ.get("WOA_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+                try:
+                    debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "woa_debug") if not getattr(sys, "frozen", False) else os.path.join(os.path.dirname(sys.executable), "woa_debug")
+                    self.log(f">>> [WOA_DEBUG] 已开启，仅在启动时执行方案测试，结果保存至: {debug_dir}")
+                except Exception:
+                    self.log(">>> [WOA_DEBUG] 已开启，仅在启动时执行方案测试")
+                self.log(">>> [WOA_DEBUG] 正在进行截图与触控方案测试...")
+                self.adb.run_all_method_tests()
+                woa_debug_set_runtime_started()
+                self.log(">>> [WOA_DEBUG] 方案测试完成，开始主循环")
             thread = threading.Thread(target=self._main_loop)
             thread.daemon = True
             thread.start()
@@ -756,6 +803,16 @@ class WoaBot:
             pass
 
     def _main_loop(self):
+        try:
+            self._do_main_loop()
+        except Exception:
+            # 这里的异常会触发全局异常钩子
+            if hasattr(sys, 'excepthook'):
+                sys.excepthook(*sys.exc_info())
+            else:
+                traceback.print_exc()
+
+    def _do_main_loop(self):
         self.log("[DEBUG] 主循环线程已启动")
         self.sleep(1.0)
         self.last_periodic_check_time = 0
@@ -782,12 +839,33 @@ class WoaBot:
                 self.log(">>> [系统] 停止指令，终止...")
                 break
             except Exception as e:
+                # 出现异常，打印堆栈
                 traceback.print_exc()
-                self.log(f"❌ 运行出错: {e}")
+                error_msg = f"❌ 运行出错: {e}"
+                self.log(error_msg)
+                
+                # 如果连续出错，主动触发系统的异常处理逻辑（生成报告并重启或停止）
+                if not hasattr(self, 'consecutive_errors'):
+                    self.consecutive_errors = 0
+                self.consecutive_errors += 1
+                
+                if self.consecutive_errors >= 6:
+                    self.log("🛑 检测到持续报错，脚本将终止运行以防止僵死状态")
+                    # 主动调用全局异常处理逻辑（通过 sys.excepthook）
+                    if hasattr(sys, 'excepthook'):
+                        exc_type, exc_value, exc_traceback = sys.exc_info()
+                        if exc_type:
+                            sys.excepthook(exc_type, exc_value, exc_traceback)
+                    self.running = False
+                    break
+                
                 try:
                     self.sleep(3.0)
                 except:
                     break
+            else:
+                # 如果成功运行一轮，重置连续错误计数
+                self.consecutive_errors = 0
         self.log(">>> 脚本已完全停止")
         try:
             if hasattr(self, 'adb') and self.adb:
@@ -1044,7 +1122,8 @@ class WoaBot:
         if not self._verify_and_redirect('status_approach.png'): return True
         self.log(">>> [任务] 处理进场...")
         start_time = time.time()
-        while time.time() - start_time < 2.0:
+        approach_timeout = 1.0 if getattr(self.adb, 'screenshot_method', 'adb') in ('nemu_ipc', 'uiautomator2') else 2.0
+        while time.time() - start_time < approach_timeout:
             self._check_running()
             if self.find_and_click('landing_permitted.png', wait=0):
                 return True
@@ -1058,7 +1137,8 @@ class WoaBot:
                 self.log("   -> 分配机位")
                 self.adb.click(res_vacant[0] + vx, res_vacant[1] + vy)
                 self.sleep(0.1)
-                if self.wait_and_click('stand_confirm.png', timeout=1.5, click_wait=0):
+                stand_confirm_t = 1.0 if getattr(self.adb, 'screenshot_method', 'adb') in ('nemu_ipc', 'uiautomator2') else 1.5
+                if self.wait_and_click('stand_confirm.png', timeout=stand_confirm_t, click_wait=0):
                     w_start = time.time()
                     while time.time() - w_start < 2.5:
                         self._check_running()
@@ -1089,7 +1169,8 @@ class WoaBot:
         self.sleep(0.2)
         if not self._verify_and_redirect('status_taxiing.png'): return True
         self.log(">>> [任务] 处理跑道穿越...")
-        if self.wait_and_click('cross_runway.png', timeout=3.0, click_wait=0): return True
+        taxi_timeout = 1.0 if getattr(self.adb, 'screenshot_method', 'adb') in ('nemu_ipc', 'uiautomator2') else 3.0
+        if self.wait_and_click('cross_runway.png', timeout=taxi_timeout, click_wait=0): return True
         self.log("⚠️ 未找到按钮")
         self.close_window()
         return False
@@ -1102,7 +1183,7 @@ class WoaBot:
         action_buttons = ['push_back.png', 'taxi_to_runway.png', 'wait.png', 'takeoff_by_gliding.png', 'takeoff.png',
                           'get_award_1.png', 'get_award_4.png', 'start_general.png']
         sm = getattr(self.adb, 'screenshot_method', 'adb')
-        scan_timeout = 1.0 if sm in ('nemu_ipc', 'uiautomator2', 'droidcast_raw') else 5.0
+        scan_timeout = 1.0 if sm in ('nemu_ipc', 'uiautomator2') else 5.0
         while time.time() - start_time < scan_timeout:
             self._check_running()
             screen = self.adb.get_screenshot()
@@ -1117,45 +1198,47 @@ class WoaBot:
                     if btn == 'get_award_1.png' or btn == 'get_award_4.png':
                         self.log("   -> 🎁 发现领奖图标，进入流程")
                         self.adb.click(x, y)
+                        self.sleep(0.4)  # 等待弹窗完全出现，避免 nemu_ipc 等高速截图下未就绪
                         got_step2 = False
                         t2_start = time.time()
+                        # 领奖第二步按钮：降低置信度、减小点击偏移，提高点击成功率
+                        def _reward_step2_click(name):
+                            return self.find_and_click(name, confidence=0.72, wait=0.6, random_offset=3)
                         while time.time() - t2_start < 15.0:
                             self._check_running()
-                            if self.find_and_click('get_award_2.png', wait=0.5) or \
-                                    self.find_and_click('get_award_3.png', wait=0.5) or \
-                                    self.find_and_click('get_award_4.png', wait=0.5):
+                            if _reward_step2_click('get_award_2.png') or \
+                                    _reward_step2_click('get_award_3.png') or \
+                                    _reward_step2_click('get_award_4.png'):
                                 got_step2 = True
                                 break
                             time.sleep(0.1)
                         if not got_step2:
                             self.log("🛑 领奖流程卡死")
                             return False
-                        self.log("   -> 领奖确认，等待后续...")
+                        self.log("   -> 领奖确认，等待开始检测下一步...")
+                        self.sleep(1.7)
+                        t3_timeout = 1.0 if sm in ('nemu_ipc', 'uiautomator2') else 2.0
                         t3_start = time.time()
-                        while time.time() - t3_start < 15.0:
+                        while time.time() - t3_start < t3_timeout:
                             self._check_running()
                             s3_screen = self.adb.get_screenshot()
-                            if s3_screen is None: continue
+                            if s3_screen is None:
+                                time.sleep(0.1)
+                                continue
                             s3_roi = s3_screen[by:by + bh, bx:bx + bw]
                             for final_btn in ['push_back.png', 'taxi_to_runway.png', 'start_general.png']:
                                 res_final = self.adb.locate_image(self.icon_path + final_btn, confidence=0.7,
                                                                   screen_image=s3_roi)
                                 if res_final:
-                                    self.sleep(1.5)
                                     self.adb.click(res_final[0] + bx, res_final[1] + by)
                                     self.log("   -> ✅ 离场动作执行完毕")
                                     return True
-
-                            self.sleep(2.0)
-                            if self.safe_locate('green_dot.png', region=self.REGION_GREEN_DOT):
-                                self.log("   -> ⚠️ 检测到绿点，跳转至地勤分配...")
-                                self.sleep(0.5)
-                                return self.handle_stand_task()
-                            else:
-                                self.log("   -> ℹ️ 未检测到绿点，判定为塔台已接管")
-                                return True
-
                             time.sleep(0.1)
+                        if self.safe_locate('green_dot.png', region=self.REGION_GREEN_DOT):
+                            self.log("   -> ⚠️ 检测到绿点，跳转至地勤分配...")
+                            self.sleep(0.5)
+                            return self.handle_stand_task()
+                        self.log("   -> ℹ️ 未检测到绿点，判定为塔台已接管")
                         return True
                     self.adb.click(x, y)
                     self.sleep(0.5)
@@ -1240,7 +1323,8 @@ class WoaBot:
         self.sleep(0.2)
         if not self._verify_and_redirect('status_ice.png'): return True
         self.log(">>> [任务] 处理除冰...")
-        if self.wait_and_click('start_ice.png', timeout=3.0, click_wait=0.5):
+        ice_timeout = 1.0 if getattr(self.adb, 'screenshot_method', 'adb') in ('nemu_ipc', 'uiautomator2') else 3.0
+        if self.wait_and_click('start_ice.png', timeout=ice_timeout, click_wait=0.5):
             self.log("   -> 除冰开始")
             return True
         self.log("⚠️ 未找到除冰按钮")
@@ -1252,7 +1336,8 @@ class WoaBot:
         self.log(">>> [任务] 处理维修/维护...")
         action_buttons = ['go_repair.png', 'start_repair.png', 'start_general.png']
         start_time = time.time()
-        while time.time() - start_time < 3.0:
+        repair_timeout = 1.0 if getattr(self.adb, 'screenshot_method', 'adb') in ('nemu_ipc', 'uiautomator2') else 3.0
+        while time.time() - start_time < repair_timeout:
             self._check_running()
             screen = self.adb.get_screenshot()
             if screen is None: continue
@@ -1266,6 +1351,16 @@ class WoaBot:
                     self.adb.click(abs_x, abs_y)
                     self.log(f"   -> ✅ 维护开始 ({btn})")
                     self.sleep(0.5)
+                    if btn == 'start_repair.png':
+                        self._check_running()
+                        s2 = self.adb.get_screenshot()
+                        if s2 is not None:
+                            roi2 = s2[by:by + bh, bx:bx + bw]
+                            res2 = self.adb.locate_image(self.icon_path + 'go_repair.png', confidence=0.8, screen_image=roi2)
+                            if res2:
+                                self.adb.click(res2[0] + bx, res2[1] + by)
+                                self.log("   -> ✅ 点击 go_repair")
+                                self.sleep(0.5)
                     return True
             time.sleep(0.1)
         self.log("⚠️ 未找到维修按钮")
@@ -1448,29 +1543,16 @@ class WoaBot:
             return False
         lx, ly, lw, lh = self.LIST_ROI_X, 0, self.LIST_ROI_W, self.LIST_ROI_H
         list_roi_img = current_screen[ly:ly + lh, lx:lx + lw]
+        bx, by, bw, bh = self.REGION_BOTTOM_ROI
+        bottom_roi = current_screen[by:by + bh, bx:bx + bw]
+        vx, vy, vw, vh = self.REGION_VACANT_ROI
+        vacant_roi = current_screen[vy:vy + vh, vx:vx + vw]
+        gx, gy, gw, gh = self.REGION_GREEN_DOT
+        green_roi = current_screen[gy:gy + gh, gx:gx + gw]
+        sx, sy, sw, sh = self.REGION_STATUS_TITLE
+        status_roi = current_screen[sy:sy + sh, sx:sx + sw]
         raw_detections, final_tasks = self._run_pending_detection(list_roi_img)
-        if len(final_tasks) == 0 and self.adb.screenshot_method == "nemu_ipc":
-            adb_screen = self.adb.get_screenshot(force_method="adb")
-            if adb_screen is not None:
-                list_roi_adb = adb_screen[ly:ly + lh, lx:lx + lw]
-                _, final_tasks = self._run_pending_detection(list_roi_adb)
-                if len(final_tasks) > 0:
-                    if not getattr(self, '_nemu_ipc_fallback_logged', False):
-                        self._nemu_ipc_fallback_logged = True
-                        self._nemu_ipc_debug_save_mismatch(current_screen, adb_screen)
-                        self.log(f"📋 [检测] nemu_ipc 与模板不匹配，已切换 ADB。请设 NEMU_IPC_DEBUG=1 并重启以生成调试截图，或尝试 NEMU_IPC_PIXEL_FORMAT=bgra / NEMU_IPC_FLIP=0")
-                    self.adb.set_screenshot_method("adb")
-        if len(final_tasks) == 0 and self.adb.screenshot_method == "droidcast_raw":
-            adb_screen = self.adb.get_screenshot(force_method="adb")
-            if adb_screen is not None:
-                list_roi_adb = adb_screen[ly:ly + lh, lx:lx + lw]
-                _, final_tasks = self._run_pending_detection(list_roi_adb)
-                if len(final_tasks) > 0:
-                    if not getattr(self, '_droidcast_raw_fallback_logged', False):
-                        self._droidcast_raw_fallback_logged = True
-                        self._droidcast_raw_debug_save_mismatch(current_screen, adb_screen)
-                        self.log(f"📋 [检测] DroidCast_raw 与模板不匹配，已切换 ADB。请查看 droidcast_raw_debug/ 对比图排查。")
-                    self.adb.set_screenshot_method("adb")
+        # 注意：运行过程中不再与 ADB 校验后自动回退，仅在启动时通过截图方案测试和回退链确定方案
 
         doing_tasks = [d for d in final_tasks if d['type'] == 'doing']
         for det in doing_tasks:

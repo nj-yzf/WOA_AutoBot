@@ -4,6 +4,8 @@ import threading
 import queue
 import json
 import datetime
+import collections
+import traceback
 import tkinter as tk
 import ctypes
 import subprocess
@@ -20,7 +22,7 @@ from ttkbootstrap.tooltip import ToolTip  # type: ignore[import-untyped]
 from PIL import Image, ImageTk
 
 # 引入后端逻辑
-from adb_controller import set_custom_adb_path, AdbController, CURRENT_ADB_PATH, close_all_and_kill_server
+from adb_controller import set_custom_adb_path, AdbController, CURRENT_ADB_PATH, close_all_and_kill_server, get_woa_debug_dir
 
 # MuMu 常用 ADB 端口（部分机型如 MuMu12+Vulkan 需用 MuMu 自带 adb 才能正常点击）
 _MUMU_PORTS = {16384, 16385, 16416, 16448, 7555, 5555}
@@ -54,6 +56,61 @@ _ICON_DIR = "icon"
 
 CONFIG_FILE = "config.json"
 
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """全局未捕获异常处理，生成崩溃日志"""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    # 生成调试目录
+    try:
+        from adb_controller import get_woa_debug_dir
+        debug_dir = get_woa_debug_dir()
+        os.makedirs(debug_dir, exist_ok=True)
+        crash_log_path = os.path.join(debug_dir, f"crash_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+    except Exception:
+        # 失败则退而求其次
+        crash_log_path = f"crash_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
+    # 尝试获取最后的日志缓冲
+    last_logs = ""
+    try:
+        # sys.stdout 应该是 MultiTextRedirector 或 TeeToFile
+        if hasattr(sys.stdout, "log_buffer"):
+            last_logs = "\n".join(list(sys.stdout.log_buffer))
+        elif hasattr(sys.stdout, "stream") and hasattr(sys.stdout.stream, "log_buffer"):
+            last_logs = "\n".join(list(sys.stdout.stream.log_buffer))
+    except Exception:
+        pass
+
+    # 写入报告
+    with open(crash_log_path, "w", encoding="utf-8") as f:
+        f.write("=== WOA AutoBot CRASH REPORT ===\n")
+        f.write(f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("--- EXCEPTION STACK TRACE ---\n")
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+        f.write("\n--- LAST PRESERVED LOGS ---\n")
+        if last_logs:
+            f.write(last_logs)
+        else:
+            f.write("(No logs preserved in buffer)")
+        f.write("\n\n=== END REPORT ===\n")
+
+    # 打印到控制台
+    print(f"\n🛑 [严重错误] 脚本发生异常退出，详细日志已保存至: {crash_log_path}")
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+    
+    # 弹出错误窗口
+    try:
+        messagebox.showerror("程序崩溃", f"脚本发生严重错误，已保存详细日志到: {crash_log_path}")
+    except:
+        pass
+
+
+# 设置全局异常钩子
+sys.excepthook = handle_exception
+
+
 # === 增强型日志重定向器 ===
 class MultiTextRedirector(object):
     def __init__(self, widgets=None, tag="stdout"):
@@ -61,6 +118,7 @@ class MultiTextRedirector(object):
             widgets = []
         self.widgets = widgets
         self.tag = tag
+        self.log_buffer = collections.deque(maxlen=200)  # 保留最近200条日志以便发生错误时导出
 
     def add_widget(self, widget):
         if widget not in self.widgets:
@@ -73,6 +131,7 @@ class MultiTextRedirector(object):
         widget.tag_config("success", foreground="#75b798")
         widget.tag_config("error", foreground="#ea868f")
         widget.tag_config("highlight", foreground="#fd7e14")
+        widget.tag_config("method", foreground="#c9a227")
 
     def write(self, str_val):
         if "-> 执行动作:" in str_val: return
@@ -90,7 +149,10 @@ class MultiTextRedirector(object):
             tag = "error"
         elif any(x in str_val for x in ["⚠️", "警告", "注意", "跳过", "超时"]):
             tag = "highlight"
+        elif any(x in str_val for x in ["[模式]", "触控方案", "截图方案", "触控:", "截图:"]):
+            tag = "method"
 
+        self.log_buffer.append(f"{time_prefix}{str_val}")
         self._insert_to_all(time_prefix, "time", str_val, tag)
 
     def _insert_to_all(self, txt1, tag1, txt2=None, tag2=None):
@@ -119,10 +181,42 @@ class MultiTextRedirector(object):
         pass
 
 
+class TeeToFile:
+    """调试模式下将日志同时输出到控件和文件"""
+    def __init__(self, stream, filepath):
+        self.stream = stream
+        self.filepath = filepath
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        self._file = open(filepath, "w", encoding="utf-8")
+        self._file.write(f"=== WOA AutoBot 调试日志 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
+
+    def write(self, s):
+        self.stream.write(s)
+        try:
+            ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-4]
+            self._file.write(f"[{ts}] {s}")
+            self._file.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        self.stream.flush()
+        try:
+            self._file.flush()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+
 class Application(ttkb.Window):
     def __init__(self):
         try:
-            myappid = 'woabot.launcher.v1.2.3'
+            myappid = 'woabot.launcher.v1.2.3b1'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except:
             pass
@@ -134,7 +228,7 @@ class Application(ttkb.Window):
         self.style.colors.primary = "#89b0ae"
         self.style.colors.info = "#9cbfdd"
 
-        self.title("WOA AutoBot v1.2.3")
+        self.title("WOA AutoBot v1.2.3b1")
         self.geometry("680x850")
         self.last_geometry = "680x850"
         self.is_mini_mode = False
@@ -158,7 +252,17 @@ class Application(ttkb.Window):
         self.queue_check_interval = 100
 
         self.redirector = MultiTextRedirector()
-        sys.stdout = self.redirector
+        self._log_tee = None
+        if os.environ.get("WOA_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+            try:
+                debug_dir = get_woa_debug_dir()
+                log_path = os.path.join(debug_dir, f"log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+                self._log_tee = TeeToFile(self.redirector, log_path)
+                sys.stdout = self._log_tee
+            except Exception:
+                sys.stdout = self.redirector
+        else:
+            sys.stdout = self.redirector
 
         self.container_main = ttkb.Frame(self)
         self.container_mini = ttkb.Frame(self)
@@ -174,11 +278,12 @@ class Application(ttkb.Window):
             m2 = "获取更新和反馈问题请加入QQ群1067076460。"
             print(m1)
             print(m2)
-            if getattr(sys, "__stdout__", None) and sys.__stdout__ is not self.redirector:
+            orig = getattr(sys, "__stdout__", None)
+            if orig and getattr(sys, "stdout", None) is not orig:
                 try:
-                    sys.__stdout__.write(m1 + "\n")
-                    sys.__stdout__.write(m2 + "\n")
-                    sys.__stdout__.flush()
+                    orig.write(m1 + "\n")
+                    orig.write(m2 + "\n")
+                    orig.flush()
                 except Exception:
                     pass
         self.after(100, _emit_notice)
@@ -197,6 +302,8 @@ class Application(ttkb.Window):
         except Exception:
             pass
         try:
+            if getattr(self, "_log_tee", None):
+                self._log_tee.close()
             sys.stdout = sys.__stdout__
         except Exception:
             pass
@@ -221,7 +328,9 @@ class Application(ttkb.Window):
             except:
                 pass
             try:
-                img = Image.open(icon_path)
+                with open(icon_path, "rb") as f:
+                    img = Image.open(f)
+                    img.load()
                 if hasattr(Image, 'Resampling'):
                     resample = Image.Resampling.LANCZOS
                 else:
@@ -393,6 +502,8 @@ class Application(ttkb.Window):
             self.after(0, lambda: self._apply_scan_result(devs))
 
         self.btn_scan.configure(text="扫描中...", state="disabled")
+        for btn in [self.btn_main_start, self.btn_mini_start]:
+            btn.configure(state="disabled")
         self.update_idletasks()
         t = threading.Thread(target=_worker)
         t.daemon = True
@@ -402,6 +513,9 @@ class Application(ttkb.Window):
         """在主线程更新扫描结果"""
         try:
             self.btn_scan.configure(text="智能扫描", state="normal")
+            if not (getattr(self, 'bot', None) and self.bot.running):
+                for btn in [self.btn_main_start, self.btn_mini_start]:
+                    btn.configure(state="normal", text="▶ 启动脚本")
             self.combo_devices['values'] = devs
             if devs:
                 self.combo_devices.current(0)
@@ -468,7 +582,7 @@ class Application(ttkb.Window):
         win = ttkb.Toplevel(self)
         self.settings_win = win
         win.title("高级设置")
-        win.geometry("540x780")
+        win.geometry("540x820")
         win.transient(self)
         win.grab_set()
         body = ttkb.Frame(win, padding=20)
@@ -508,6 +622,25 @@ class Application(ttkb.Window):
 
         # 【颜色统一】浏览路径按钮 -> 绿色边框
         ttkb.Button(f_adb, text="...", bootstyle="outline-success", command=browse).pack(side=LEFT)
+
+        ttkb.Label(body, text="MuMu 安装路径", font=("bold")).pack(anchor="w")
+        f_mumu = ttkb.Frame(body)
+        f_mumu.pack(fill=X, pady=5)
+        e_mumu = ttkb.Entry(f_mumu)
+        e_mumu.pack(side=LEFT, fill=X, expand=True, padx=(0, 5))
+        mp = self.config.get("mumu_path", "")
+        if mp:
+            e_mumu.insert(0, mp)
+
+        def browse_mumu():
+            p = filedialog.askdirectory(parent=win, title="选择 MuMu 安装目录")
+            if p:
+                e_mumu.delete(0, END)
+                e_mumu.insert(0, p)
+            win.lift()
+
+        ttkb.Button(f_mumu, text="...", bootstyle="outline-success", command=browse_mumu).pack(side=LEFT)
+        ToolTip(e_mumu, text="用于 nemu_ipc 截图。留空则自动检测；自动检测成功时会回填此处。", bootstyle="info")
 
         ttkb.Separator(body).pack(fill=X, pady=10)
         ttkb.Label(body, text="触控方式", font=("bold")).pack(anchor="w")
@@ -607,6 +740,11 @@ class Application(ttkb.Window):
             else:
                 if "adb_path" in self.config: del self.config["adb_path"]
                 set_custom_adb_path(None)
+            mp = e_mumu.get().strip()
+            if mp and os.path.isdir(mp):
+                self.config["mumu_path"] = mp
+            else:
+                if "mumu_path" in self.config: del self.config["mumu_path"]
             ctrl = ctrl_method.get().strip().lower()
             valid_ctrl = ("adb", "minitouch", "uiautomator2")
             self.config["control_method"] = ctrl if ctrl in valid_ctrl else "minitouch"
@@ -633,6 +771,9 @@ class Application(ttkb.Window):
             if old_cfg.get("adb_path") != self.config.get("adb_path"):
                 v = self.config.get("adb_path") or "自动"
                 changed.append(("ADB 路径", str(v)))
+            if old_cfg.get("mumu_path") != self.config.get("mumu_path"):
+                v = self.config.get("mumu_path") or "自动"
+                changed.append(("MuMu 安装路径", str(v)))
             if old_cfg.get("control_method") != self.config.get("control_method"):
                 changed.append(("触控方式", self.config.get("control_method", "minitouch")))
             if old_cfg.get("screenshot_method") != self.config.get("screenshot_method"):
@@ -666,9 +807,19 @@ class Application(ttkb.Window):
     def refresh_devices(self):
         print(">>> 正在扫描设备...")
         self.btn_scan.configure(text="扫描中...", state="disabled")
+        for btn in [self.btn_main_start, self.btn_mini_start]:
+            btn.configure(state="disabled")
         self.update()
-        devs = AdbController.scan_devices(debug=True)
-        self.btn_scan.configure(text="智能扫描", state="normal")
+        try:
+            devs = AdbController.scan_devices(debug=True)
+        except Exception as e:
+            print(f">>> [扫描异常] {e}")
+            devs = []
+        finally:
+            self.btn_scan.configure(text="智能扫描", state="normal")
+            if not (getattr(self, 'bot', None) and self.bot.running):
+                for btn in [self.btn_main_start, self.btn_mini_start]:
+                    btn.configure(state="normal", text="▶ 启动脚本")
         self.combo_devices['values'] = devs
         if devs:
             self.combo_devices.current(0)
@@ -754,12 +905,16 @@ class Application(ttkb.Window):
             self.bot.set_cancel_stand_filter_when_tower_off(self.var_cancel_stand_filter.get())
             self.bot.set_control_method(self.config.get("control_method", "minitouch"))
             self.bot.set_screenshot_method(self.config.get("screenshot_method", "nemu_ipc"))
+            self.bot.set_mumu_path(self.config.get("mumu_path", ""))
 
     def on_bot_config_update(self, key, value):
         if key == "auto_delay_count":
             self.var_delay_count.set(str(value))
         elif key == "vehicle_buy":
             self.var_vehicle_buy.set(bool(value))
+        elif key == "mumu_path":
+            self.config["mumu_path"] = value
+            self.save_config()
 
     def log_to_queue(self, msg):
         self.log_queue.put(msg)
@@ -775,5 +930,13 @@ class Application(ttkb.Window):
 
 
 if __name__ == "__main__":
-    app = Application()
-    app.mainloop()
+    try:
+        app = Application()
+        app.mainloop()
+    except Exception:
+        # 捕获 mainloop 中的异常并手动调用异常处理钩子
+        if sys.excepthook:
+            sys.excepthook(*sys.exc_info())
+        else:
+            traceback.print_exc()
+            sys.exit(1)

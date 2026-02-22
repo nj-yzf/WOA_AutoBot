@@ -154,6 +154,84 @@ def get_mumu_adb_paths() -> List[str]:
     return list(dict.fromkeys(found))
 
 
+def serial_to_nemu_id(serial: str) -> Optional[int]:
+    """
+    从 serial 解析 MuMu12 instance_id（参考 ALAS NemuIpcImpl.serial_to_id）
+    端口 16384-17408 对应 MuMu12，公式: port = 16384 + 32*index + offset
+    """
+    if not serial or ":" not in serial:
+        return None
+    try:
+        port = int(serial.split(":")[1])
+    except (ValueError, IndexError):
+        return None
+    index, offset = divmod(port - 16384 + 16, 32)
+    offset -= 16
+    if 0 <= index < 32 and offset in (-2, -1, 0, 1, 2):
+        return index
+    return None
+
+
+def _find_dll_in_folder(folder: str) -> Optional[str]:
+    """在 folder 及其子路径中查找 external_renderer_ipc.dll"""
+    for rel in ("shell/sdk/external_renderer_ipc.dll", "nx_device/12.0/shell/sdk/external_renderer_ipc.dll"):
+        fp = os.path.join(folder, rel)
+        if os.path.isfile(fp):
+            return fp
+    return None
+
+
+def get_mumu_nemu_folders_for_serial(serial: str) -> List[Tuple[str, int]]:
+    """
+    为指定 serial 查找所有可能包含 nemu_ipc DLL 的 MuMu 根目录（参考 ALAS）
+    用于 vms 未枚举到设备时的回退发现
+    Returns: [(folder, instance_id), ...]
+    """
+    index = serial_to_nemu_id(serial)
+    if index is None:
+        return []
+    bases = [
+        r"E:\APP\MuMuPlayer",
+        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Netease"),
+    ]
+    for drive in ["C", "D", "E", "F"]:
+        bases.extend([
+            rf"{drive}:\Program Files\Netease",
+            rf"{drive}:\APP\MuMuPlayer",
+            rf"{drive}:\Program Files (x86)\Netease",
+        ])
+    result = []
+    seen_base = set()
+    seen_folder = set()
+    for base in bases:
+        if not base or not os.path.isdir(base) or base in seen_base:
+            continue
+        seen_base.add(base)
+        cands = [base]
+        for sub in ("MuMu Player 12", "MuMuPlayer-12.0", "MuMuPlayer12", "MuMu"):
+            p = os.path.join(base, sub)
+            if os.path.isdir(p):
+                cands.append(p)
+        try:
+            for name in os.listdir(base):
+                if "MuMu" not in name:
+                    continue
+                p = os.path.join(base, name)
+                if os.path.isdir(p) and p not in cands:
+                    cands.append(p)
+        except Exception:
+            pass
+        for folder in cands:
+            absp = os.path.abspath(folder)
+            if absp in seen_folder:
+                continue
+            if _find_dll_in_folder(folder):
+                seen_folder.add(absp)
+                result.append((absp, index))
+    return result
+
+
 def get_serials_from_registry() -> List[str]:
     """从注册表发现模拟器实例的 ADB 序列号 (参考 ALAS iter_uninstall_registry)"""
     if not winreg:
