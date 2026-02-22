@@ -1,0 +1,28 @@
+# 排除打包生成物
+dist/
+dist_nuitka/
+build/
+*.dist/
+*.build/
+*.exe
+*.spec
+
+# 排除参考项目
+AzurLaneAutoScript-master/
+
+# 排除本地配置与日志
+config.json
+*.log
+nemu_ipc_debug/
+droidcast_raw_debug/
+
+# 排除 Python 缓存与环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+
+# 排除临时文件
+_gen_obf.py
