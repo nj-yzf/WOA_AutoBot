@@ -54,14 +54,6 @@ _ICON_DIR = "icon"
 
 CONFIG_FILE = "config.json"
 
-# 关键声明（XOR 混淆，降低篡改概率）
-def _x(b, k=0x5A):
-    return bytes(x ^ k for x in b).decode("utf-8")
-
-_S1 = bytes([188, 247, 254, 178, 222, 192, 188, 198, 246, 191, 244, 214, 191, 223, 242, 191, 223, 215, 178, 238, 227, 181, 230, 214, 191, 252, 216, 188, 216, 242, 190, 225, 212, 190, 225, 225, 190, 231, 207, 188, 226, 250, 179, 219, 201, 178, 238, 247, 190, 227, 234, 178, 212, 237, 191, 228, 205, 181, 230, 214, 178, 245, 237, 191, 234, 199, 178, 245, 207, 179, 218, 218, 188, 246, 228, 185, 218, 216])
-_S2 = bytes([178, 212, 237, 191, 213, 204, 188, 193, 238, 188, 204, 234, 191, 200, 214, 191, 213, 215, 179, 252, 210, 179, 205, 244, 179, 248, 194, 178, 245, 237, 191, 208, 250, 191, 223, 255, 11, 11, 189, 228, 254, 107, 106, 108, 109, 106, 109, 108, 110, 108, 106, 185, 218, 216])
-
-
 # === 增强型日志重定向器 ===
 class MultiTextRedirector(object):
     def __init__(self, widgets=None, tag="stdout"):
@@ -178,7 +170,8 @@ class Application(ttkb.Window):
         self.after(self.queue_check_interval, self.process_log_queue)
 
         def _emit_notice():
-            m1, m2 = _x(_S1), _x(_S2)
+            m1 = "本脚本为开源免费脚本。此脚本完全免费，如您从任何渠道购买获得，请尝试退款。"
+            m2 = "获取更新和反馈问题请加入QQ群1067076460。"
             print(m1)
             print(m2)
             if getattr(sys, "__stdout__", None) and sys.__stdout__ is not self.redirector:
@@ -453,8 +446,9 @@ class Application(ttkb.Window):
         scroll = ttkb.Scrollbar(container, command=text_area.yview)
         scroll.pack(side=RIGHT, fill=Y)
         text_area.config(yscrollcommand=scroll.set)
-        help_content = """此脚本完全免费，如您从任何渠道购买获得，请尝试退款。
+        help_content = """本脚本为开源免费脚本。此脚本完全免费，如您从任何渠道购买获得，请尝试退款。
         获取更新和反馈问题请加入QQ群1067076460。
+        项目开源地址：https://github.com/nj-yzf/WOA_AutoBot
 
         【使用说明】
         1. 仅支持在Windows系统上使用的安卓模拟器，推荐使用 MuMu 模拟器，模拟器分辨率必须设置为 1600x900 ！\n
