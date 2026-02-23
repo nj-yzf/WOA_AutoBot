@@ -5,7 +5,7 @@
 
 WOA AutoBot 是一款专为《World of Airports》世界机场游戏开发的自动化辅助工具。旨在通过图像识别技术，帮助玩家处理繁琐的机场地面任务，提升挂机效率。
 
-开发者仅为初学者，代码水平有些，并大量使用了Cursor、Calude、Gemini等AI工具辅助开发。
+开发者仅为初学者，水平有限，并大量使用了Cursor、Calude、Gemini等AI工具辅助开发。
 
 ## 🤝 致谢 / Credits
 本项目在开发过程中，模拟器连接与控制部分的逻辑设计大量参考了 [ALAS (AzurLaneAutoScript)](https://github.com/LmeSzinc/AzurLaneAutoScript)。
