@@ -30,18 +30,7 @@ WOA AutoBot 是一款专为《World of Airports》世界机场游戏开发的自
 
 ## 🚀 快速开始
 
-### 方式一：直接运行 (推荐)
 1. 从 [Releases] 页面下载打包好的 `WOA_AutoBot.zip`。
 2. 运行模拟器并进入游戏机场界面。
 3. 打开脚本，点击“智能扫描”，选择你的模拟器。
 4. 点击“启动脚本”。
-
-### 方式二：源码运行 (开发者)
-git clone https://github.com/nj-yzf/WOA_AutoBot
-<<<<<<< HEAD
-cd WOA_Speed_Test
-=======
-cd WOA_AutoBot
->>>>>>> 4ef6d7df36c6e1533a32c916bf70e46cb285de91
-pip install -r requirements.txt
-python gui_launcher.py
