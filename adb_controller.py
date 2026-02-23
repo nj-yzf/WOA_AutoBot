@@ -1,3 +1,6 @@
+# 此模块的连接逻辑参考了 ALAS 项目的设计思路
+# Reference: https://github.com/LmeSzinc/AzurLaneAutoScript
+
 import atexit
 import ctypes
 import socket
