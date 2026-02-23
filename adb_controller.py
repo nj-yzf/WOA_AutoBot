@@ -15,6 +15,9 @@ import threading
 # 用于进程退出时清理残留（含非正常关闭）
 _adb_instances = []
 
+# 写死为 0，长期关闭 nemu_ipc_debug 文件夹内截图保存；改为 1 可重新开启
+NEMU_IPC_DEBUG = 0
+
 
 class _SafeDLLWrapper:
     """包装 DLL 句柄，手动通过 GetProcAddress 获取函数地址，绕过 Nuitka 的 ctypes 拦截逻辑"""
@@ -1553,7 +1556,7 @@ class AdbController:
             do_flip = os.environ.get("NEMU_IPC_FLIP", "1") != "0"
             if do_flip:
                 img = cv2.flip(img, 0)
-            if os.environ.get("NEMU_IPC_DEBUG") == "1":
+            if NEMU_IPC_DEBUG:
                 self._nemu_ipc_debug_save(img, arr, width, height, pixel_fmt, do_flip)
             return img
         except Exception as e:

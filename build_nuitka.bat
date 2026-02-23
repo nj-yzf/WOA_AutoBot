@@ -20,7 +20,7 @@ if exist gui_launcher.build rmdir /s /q gui_launcher.build
 if exist gui_launcher.dist rmdir /s /q gui_launcher.dist
 
 echo [3/6] Running Nuitka...
-call python -m nuitka --standalone --output-filename=WOA_AutoBot.exe --windows-console-mode=disable --python-flag=no_docstrings --nofollow-import-to=cv2.gapi --nofollow-import-to=cv2.ml --windows-product-name="WOA AutoBot" --windows-product-version=1.2.3.2 --windows-file-version=1.2.3.2 --windows-company-name="WOA AutoBot" --windows-file-description="WOA Airport Game Automation Bot" --plugin-enable=tk-inter --include-package=ttkbootstrap --include-package=cv2 --include-package=numpy --include-package=PIL --include-data-dir="%~dp0icon"=icon --include-raw-dir="%~dp0adb_tools"=adb_tools --include-data-dir="%~dp0assets"=assets --windows-icon-from-ico="%~dp0icon\app.ico" --output-dir="%~dp0dist_nuitka" --jobs=4 "%~dp0gui_launcher.py"
+call python -m nuitka --standalone --output-filename=WOA_AutoBot.exe --windows-console-mode=disable --python-flag=no_docstrings --nofollow-import-to=cv2.gapi --nofollow-import-to=cv2.ml --windows-product-name="WOA AutoBot" --windows-product-version=1.2.4 --windows-file-version=1.2.4 --windows-company-name="WOA AutoBot" --windows-file-description="WOA Airport Game Automation Bot" --plugin-enable=tk-inter --include-package=ttkbootstrap --include-package=cv2 --include-package=numpy --include-package=PIL --include-data-dir="%~dp0icon"=icon --include-raw-dir="%~dp0adb_tools"=adb_tools --include-data-dir="%~dp0assets"=assets --windows-icon-from-ico="%~dp0icon\app.ico" --output-dir="%~dp0dist_nuitka" --jobs=4 "%~dp0gui_launcher.py"
 
 if errorlevel 1 (
     echo Build FAILED.

@@ -15,11 +15,15 @@ WOA AutoBot 是一款专为《World of Airports》世界机场游戏开发的自
 
 ## 🌟 核心特性
 
-- **极致速度**：支持 `nemu_ipc` (MuMu 专用) 和 `DroidCast_raw` 高速截图技术，识别响应极快。
+- **极致速度**：支持 `nemu_ipc` (MuMu 专用) 和 `uiautomator2` 高速截图技术，识别响应极快。
 - **多种触控**：支持 `minitouch` 毫秒级触控，远超标准 ADB 模拟点击。
 - **拟人化设计**：内置“随机点击偏移”、“随机思考时间”、“随机任务序列”和“滑动随机起始位置和用时”，大幅降低封号风险。
 - **全自动化**：自动领取免费地勤、自动购买车辆、自动延时塔台、自动调整筛选。
 - **多端兼容**：适配 MuMu12/6、雷电、蓝叠等主流 Windows 安卓模拟器。
+
+这是一张GUI预览图：
+
+<img width="684" height="891" alt="image" src="https://github.com/user-attachments/assets/aad4bd6f-8e83-4e62-b5fe-3de9029c9742" />
 
 ---
 

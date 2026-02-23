@@ -56,6 +56,26 @@ _ICON_DIR = "icon"
 
 CONFIG_FILE = "config.json"
 
+LOCAL_VERSION = "v1.2.4"
+_GITEE_API_CONTENTS = "https://gitee.com/api/v5/repos/shuang-nagi/WOA_AutoBot/contents/{}?ref=master"
+
+def _fetch_gitee_text(filename, timeout=6):
+    """通过 Gitee Contents API 获取文本文件内容，失败返回 None"""
+    import urllib.request
+    import base64
+    url = _GITEE_API_CONTENTS.format(filename)
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+            if isinstance(data, dict) and "content" in data:
+                return base64.b64decode(data["content"]).decode("utf-8", errors="replace").strip()
+    except Exception:
+        pass
+    return None
+
 def _write_crash_report(exc_type, exc_value, exc_traceback):
     """写入崩溃报告文件，返回文件路径。任何阶段出错都不抛异常。"""
     crash_log_path = None
@@ -163,6 +183,7 @@ class MultiTextRedirector(object):
         widget.tag_config("error", foreground="#ea868f")
         widget.tag_config("highlight", foreground="#fd7e14")
         widget.tag_config("method", foreground="#c9a227")
+        widget.tag_config("update", foreground="#e63946", font=("Microsoft YaHei UI", 10, "bold"))
 
     def write(self, str_val):
         if "-> 执行动作:" in str_val: return
@@ -174,7 +195,9 @@ class MultiTextRedirector(object):
         time_prefix = f"[{now_str}] "
 
         tag = "normal"
-        if any(x in str_val for x in ["✅", "成功", "恢复", "通过"]):
+        if "[版本更新]" in str_val:
+            tag = "update"
+        elif any(x in str_val for x in ["✅", "成功", "恢复", "通过"]):
             tag = "success"
         elif any(x in str_val for x in ["🛑", "❌", "错误", "失败", "严重", "卡死"]):
             tag = "error"
@@ -245,7 +268,7 @@ class TeeToFile:
 class Application(ttkb.Window):
     def __init__(self):
         try:
-            myappid = 'woabot.launcher.v1.2.3b2'
+            myappid = 'woabot.launcher.v1.2.4'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except:
             pass
@@ -257,7 +280,7 @@ class Application(ttkb.Window):
         self.style.colors.primary = "#89b0ae"
         self.style.colors.info = "#9cbfdd"
 
-        self.title("WOA AutoBot v1.2.3b2")
+        self.title("WOA AutoBot v1.2.4")
         self.geometry("680x850")
         self.last_geometry = "680x850"
         self.is_mini_mode = False
@@ -303,7 +326,7 @@ class Application(ttkb.Window):
         self.after(self.queue_check_interval, self.process_log_queue)
 
         def _emit_notice():
-            m1 = "此脚本为开源免费项目，如您从任何渠道购买获得，请尝试退款。"
+            m1 = "此脚本为开源免费项目，如您是从任何渠道，例如淘宝、闲鱼、拼多多购买的，请立即退款并举报！"
             m2 = "获取更新和反馈问题请加入QQ群1067076460。"
             print(m1)
             print(m2)
@@ -316,6 +339,10 @@ class Application(ttkb.Window):
                 except Exception:
                     pass
         self.after(100, _emit_notice)
+
+        def _online_checks():
+            threading.Thread(target=self._check_version_and_popup, daemon=True).start()
+        self.after(800, _online_checks)
 
         self.after(500, self.setup_window_icon)
         self.bind("<Map>", self._on_window_map)
@@ -462,10 +489,11 @@ class Application(ttkb.Window):
         self.btn_scan.pack(side=LEFT)
         f_right = ttkb.Frame(top_bar)
         f_right.pack(side=RIGHT, padx=(15, 0), fill=Y)
-        ttkb.Button(f_right, text="📖 使用说明", bootstyle="outline-info", command=self.open_help_window).pack(side=TOP,
-                                                                                                              fill=X,
-                                                                                                              pady=(5,
-                                                                                                                    2))
+        f_help_wrap = ttkb.Frame(f_right)
+        f_help_wrap.pack(side=TOP, fill=X, pady=(5, 2))
+        self.btn_help = ttkb.Button(f_help_wrap, text="📖 使用说明", bootstyle="outline-info", command=self.open_help_window)
+        self.btn_help.pack(fill=X)
+        self._help_badge = None
         ttkb.Button(f_right, text="⚙ 设置", bootstyle="outline-secondary", command=self.open_settings_window).pack(
             side=TOP, fill=X, pady=2)
         ttkb.Button(f_right, text="⤢ 小窗", bootstyle="outline-warning", command=self.toggle_mode).pack(side=TOP,
@@ -492,7 +520,7 @@ class Application(ttkb.Window):
         f_row1 = ttkb.Frame(lf_func)
         f_row1.pack(fill=X)
         add_switch(f_row1, "塔台关闭时取消停机位筛选", self.var_cancel_stand_filter,
-                   "开启后，当塔台关闭时，脚本会取消停机位飞机的筛选，仅筛选待处理飞机。")
+                   "开启后，塔台关闭时，脚本会强制取消停机位飞机的筛选，处理全部的待处理飞机。")
 
         f_tower = ttkb.Frame(f_row1)
         f_tower.pack(side=LEFT, padx=(15, 0), pady=8)
@@ -577,10 +605,164 @@ class Application(ttkb.Window):
         y = py + max(0, (ph - h) // 2)
         win.geometry(f"+{x}+{y}")
 
+    _LOCAL_HELP_CONTENT = """
+· 下载失败，您看到的使用说明是离线版本！
+· 如您的网络没有问题，请确认脚本的获取来源是否正常！
+
+【声明】
+- 此脚本为开源免费项目，如您是从任何渠道，例如淘宝、闲鱼、拼多多购买的，请立即退款并举报！
+- 获取更新和反馈问题请加入QQ群1067076460。
+- 项目开源地址：https://github.com/nj-yzf/WOA_AutoBot
+- 如遇任何问题或bug，请在QQ群内或github上进行反馈。
+- 脚本尚不稳定，如果造成账号内游戏币损失，本人概不负责！使用辅助工具有风险，请自行评估，如造成账号封禁，与作者无关！
+
+【环境配置】
+1. 仅支持在Windows系统上使用的安卓模拟器，本脚本专为MuMu模拟器优化，强烈推荐使用MuMu模拟器，模拟器分辨率必须设置为 1600x900。
+2. Mumu模拟器默认地址为127.0.0.1:16384（其他模拟器或多开，请到模拟器设置内查看），并且自备加速器，保证网络通畅。
+3. 请优先连接127.0.0.1:16384，127.0.0.1:16416之类的端口，尽量不要连接127.0.0.1:5555，emulator-5554之类的端口。
+4. 使用MuMu模拟器时，请在设备设置中关闭“网络桥接模式”，关闭“后台挂机时保活运行”选项。
+5. - 如模拟器连接遇到问题，请首先尝试手动指定ADB路径。
+   - 如nemu_ipc方案无法启用，请首先尝试手动指定MuMu安装路径（指定到例如D:\Program Files\MuMuPlayer即可，不要指定到MuMuPlayer\nx_main文件夹）。
+   - 如遇到未知问题，请尝试切换模拟器渲染模式为DirectX。
+
+【使用须知】
+1. 游戏语言：必须设置为[简体中文]。
+2. 请勿与脚本同时操作！手动操作前请先停止运行。
+3. 脚本使用双击空白处的方式关闭窗口，默认是窗口右上角附近的位置，如您发现脚本会误触飞机，请调整挂机视角，或将视角拉到最近并置于在空白处。
+4. 机位分配只会点第一个，如果不希望C型机停DEF的机位等情况，需要手动筛选机位停机类型，并且与时刻表功能不兼容，请把时刻表重置。
+
+【功能说明】
+1. 推荐使用nemu_ipc + minitouch（默认，Mumu专用，且不支持Mumu国际版）或uiautomator2 + minitouch的方案。脚本运行速度主要取决于[截图方案]，运行速度如下：nemu_ipc > uiautomator2 >> droidcast_raw >= ADB。
+2. 使用高速方案（如nemu_ipc或uiautomator2）时，由于速度很快，出错会增多，非常不建议关闭“跳过二次校验”和“跳过地勤分配验证”开关。 
+3. 脚本运行时必须保持游戏右侧筛选选项中，仅筛选出带有黄色感叹号的待处理飞机。但您无需担心！脚本可以自动检测并调整筛选状态。
+4. 使用“自动延时塔台”功能前，请保证您已开启塔台（且目前仅支持四个控制器全开），并设置好带有[延时]按钮的界面，脚本不会主动调整。
+
+【已知问题和缺陷】
+1. 脚本本身支持多开，但测试并不充分，多开很可能存在未知问题。若脚本正在运行时，开启（或关闭）第二个脚本或类似软件（如ALAS），会导致脚本运行中断，请注意，尝试停止后再重新运行。
+2. 脚本很有可能被杀毒软件误杀，如您遇到类似问题，请关闭杀毒软件。
+3. 脚本处理[需要维护]的飞机时，暂无法应对绿币不足的情况，请您根据机队规模，预留充足的绿币。
+4. 任何情况下脚本目前都没有滑动右侧任务列表的能力。
+5. 地勤不足时，脚本只会在可用地勤数量发生变化时尝试恢复分配，暂无法根据不同机型的需求智能分配。
+6. 脚本无法设置起降飞机的比例，如您需要处理的飞机很多，请配合塔台使用。
+"""
+
+    def _check_version_and_popup(self):
+        """后台线程：检查版本更新 + 首次弹窗"""
+        remote_ver = _fetch_gitee_text("version.txt", timeout=5)
+        self.after(0, lambda r=remote_ver: self._log_version_check(r))
+        if remote_ver and remote_ver.strip() != LOCAL_VERSION:
+            self.after(0, lambda v=remote_ver.strip(): self._show_update_notice(v))
+
+        if not self.config.get("popup_shown"):
+            popup_text = _fetch_gitee_text("popup.txt", timeout=5)
+            if popup_text:
+                self.after(0, lambda t=popup_text: self._show_first_run_popup(t))
+            else:
+                self.after(0, lambda: print("[联网] popup.txt 获取失败，跳过首次弹窗"))
+                self.after(0, self._show_first_run_popup_offline)
+
+        import hashlib
+        instr_text = _fetch_gitee_text("instruction.txt", timeout=5)
+        if instr_text:
+            new_hash = hashlib.md5(instr_text.encode("utf-8")).hexdigest()
+            old_hash = self.config.get("instruction_hash", "")
+            if new_hash != old_hash:
+                self._cached_instruction_text = instr_text
+                self._cached_instruction_hash = new_hash
+                self.after(0, self._show_help_badge)
+
+    def _log_version_check(self, remote_ver):
+        """在日志中输出本地版本与在线版本（无论是否一致）"""
+        online = (remote_ver and remote_ver.strip()) or "获取失败"
+        print(f"[版本检查] 本地版本：{LOCAL_VERSION}，在线版本：{online}")
+
+    def _show_update_notice(self, remote_ver):
+        print(f"⬆️ [版本更新] 发现新版本 {remote_ver}（当前 {LOCAL_VERSION}），请前往 QQ群 或 GitHub 获取更新！")
+        print(f"⬆️ [版本更新] 下载地址：https://github.com/nj-yzf/WOA_AutoBot")
+
+    def _show_first_run_popup(self, text):
+        win = ttkb.Toplevel(self)
+        win.title("通知")
+        win.geometry("520x420")
+        win.transient(self)
+        win.grab_set()
+        container = ttkb.Frame(win, padding=15)
+        container.pack(fill=BOTH, expand=True)
+        text_area = tk.Text(container, font=("Microsoft YaHei UI", 10), wrap="word",
+                            bg="white", fg="#333333", relief="flat")
+        text_area.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll = ttkb.Scrollbar(container, command=text_area.yview)
+        scroll.pack(side=RIGHT, fill=Y)
+        text_area.config(yscrollcommand=scroll.set)
+        text_area.insert("end", text)
+        text_area.configure(state="disabled")
+        def _on_close():
+            self.config["popup_shown"] = True
+            self.save_config()
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        btn_frame = ttkb.Frame(win, padding=(15, 0, 15, 10))
+        btn_frame.pack(fill=X)
+        ttkb.Button(btn_frame, text="我知道了", bootstyle="primary", command=_on_close).pack(side=RIGHT)
+        self._center_toplevel_on_parent(win)
+
+    _FIRST_RUN_OFFLINE_POPUP = """网络连接失败，如您的网络没有问题；
+请确认脚本的获取来源是否正常，确认您使用的是否为最新版本。
+
+请注意：此脚本为开源免费项目！
+如您是从任何渠道，例如淘宝、闲鱼、拼多多购买的，请立即退款并举报！
+使用前请阅读窗口右上角【使用说明】
+
+[此弹窗是一次性的，关闭后不会再出现]"""
+
+    def _show_first_run_popup_offline(self):
+        win = ttkb.Toplevel(self)
+        win.title("通知")
+        win.geometry("520x420")
+        win.transient(self)
+        win.grab_set()
+        container = ttkb.Frame(win, padding=15)
+        container.pack(fill=BOTH, expand=True)
+        text_area = tk.Text(container, font=("Microsoft YaHei UI", 10), wrap="word",
+                            bg="white", fg="#333333", relief="flat")
+        text_area.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll = ttkb.Scrollbar(container, command=text_area.yview)
+        scroll.pack(side=RIGHT, fill=Y)
+        text_area.config(yscrollcommand=scroll.set)
+        text_area.insert("end", self._FIRST_RUN_OFFLINE_POPUP)
+        text_area.configure(state="disabled")
+        def _on_close():
+            self.config["popup_shown"] = True
+            self.save_config()
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        btn_frame = ttkb.Frame(win, padding=(15, 0, 15, 10))
+        btn_frame.pack(fill=X)
+        ttkb.Button(btn_frame, text="我知道了", bootstyle="primary", command=_on_close).pack(side=RIGHT)
+        self._center_toplevel_on_parent(win)
+
+    def _show_help_badge(self):
+        if self._help_badge is not None:
+            return
+        parent = self.btn_help.master
+        try:
+            bg = ttkb.Style().lookup("TFrame", "background") or "#ffffff"
+        except Exception:
+            bg = "#ffffff"
+        dot = tk.Canvas(parent, width=10, height=10, highlightthickness=0, bd=0, bg=bg)
+        dot.create_oval(1, 1, 9, 9, fill="#e63946", outline="#e63946")
+        dot.place(relx=1.0, rely=0.0, anchor="ne", x=-2, y=2)
+        self._help_badge = dot
+
+    def _hide_help_badge(self):
+        if self._help_badge is not None:
+            self._help_badge.destroy()
+            self._help_badge = None
+
     def open_help_window(self):
         win = ttkb.Toplevel(self)
         win.title("使用说明")
-        win.geometry("600x600")
+        win.geometry("900x800")
         container = ttkb.Frame(win, padding=15)
         container.pack(fill=BOTH, expand=True)
         text_area = tk.Text(container, font=("Microsoft YaHei UI", 10), wrap="word", bg="white", fg="#333333",
@@ -589,20 +771,37 @@ class Application(ttkb.Window):
         scroll = ttkb.Scrollbar(container, command=text_area.yview)
         scroll.pack(side=RIGHT, fill=Y)
         text_area.config(yscrollcommand=scroll.set)
-        help_content = """本脚本为开源免费脚本。此脚本完全免费，如您从任何渠道购买获得，请尝试退款。
-        获取更新和反馈问题请加入QQ群1067076460。
-        项目开源地址：https://github.com/nj-yzf/WOA_AutoBot
-
-        【使用说明】
-        1. 仅支持在Windows系统上使用的安卓模拟器，推荐使用 MuMu 模拟器，模拟器分辨率必须设置为 1600x900 ！\n
-        2. Mumu模拟器默认地址为127.0.0.1:16384（不代表你的一定是这个），使用其他模拟器和模拟器多开的情况有所不同，可以都试试，并且自备加速器，保证网络通畅。\n
-        3. ！！重要：进入游戏内你的机场后，在最右侧仅筛选出带有黄色感叹号的待处理飞机，游戏语言必须设置为简体中文！！\n
-        4. 建议：脚本使用双击空白处的方式关闭窗口，默认是窗口靠上的位置，如您发现脚本会误触飞机，请调整挂机视角，或将视角拉到最大并置于在空白处。\n
-        5. 机位分配只会点第一个，如果不希望C型机停DEF的机位等情况，需要手动筛选机位停机类型，并且与时刻表功能不兼容，请把时刻表重置。\n
-        6. 脚本尚不稳定，如果造成账号内游戏币损失，本人概不负责！使用辅助工具有风险，请自行评估，如造成账号封禁，与作者无关！如遇到bug，报错等问题群里随时联系，反馈时最好带上运行日志和游戏界面的截图。"""
-        text_area.insert("end", help_content)
+        text_area.insert("end", "正在加载...\n")
         text_area.configure(state="disabled")
         self._center_toplevel_on_parent(win)
+
+        def _load():
+            import hashlib
+            cached = getattr(self, "_cached_instruction_text", None)
+            if cached:
+                content = cached
+                new_hash = getattr(self, "_cached_instruction_hash", "")
+            else:
+                content = _fetch_gitee_text("instruction.txt", timeout=6)
+                new_hash = hashlib.md5(content.encode("utf-8")).hexdigest() if content else ""
+            failed = not content
+            if not content:
+                content = self._LOCAL_HELP_CONTENT
+            def _fill():
+                if failed:
+                    print("[联网] instruction.txt 获取失败，已显示本地使用说明")
+                text_area.configure(state="normal")
+                text_area.delete("1.0", "end")
+                text_area.insert("end", content)
+                text_area.configure(state="disabled")
+                if new_hash:
+                    self.config["instruction_hash"] = new_hash
+                    self.save_config()
+                self._cached_instruction_text = None
+                self._cached_instruction_hash = None
+                self._hide_help_badge()
+            self.after(0, _fill)
+        threading.Thread(target=_load, daemon=True).start()
 
     def open_settings_window(self):
         if hasattr(self, 'settings_win') and self.settings_win.winfo_exists():
@@ -669,10 +868,10 @@ class Application(ttkb.Window):
             win.lift()
 
         ttkb.Button(f_mumu, text="...", bootstyle="outline-success", command=browse_mumu).pack(side=LEFT)
-        ToolTip(e_mumu, text="用于 nemu_ipc 截图。留空则自动检测；自动检测成功时会回填此处。", bootstyle="info")
+        ToolTip(e_mumu, text="此路径仅用于 nemu_ipc 截图，非必需。留空则自动检测；自动检测成功时会回填此处。", bootstyle="info")
 
         ttkb.Separator(body).pack(fill=X, pady=10)
-        ttkb.Label(body, text="触控方式", font=("bold")).pack(anchor="w")
+        ttkb.Label(body, text="触控方式（影响运行速度，但总体不明显）", font=("bold")).pack(anchor="w")
         f_ctrl = ttkb.Frame(body)
         f_ctrl.pack(fill=X, pady=5)
         ctrl_values = ("ADB", "minitouch", "uiautomator2")
@@ -681,12 +880,13 @@ class Application(ttkb.Window):
         cm = self.config.get("control_method", "minitouch").lower()
         idx = next((i for i, v in enumerate(ctrl_values) if v.lower() == cm), 0)
         ctrl_method.current(idx)
-        tip = ("ADB：标准 input tap，兼容性最好但较慢。\n"
-               "minitouch：socket 触控，比 ADB 快 5-10 倍。\n"
-               "uiautomator2：需 pip install uiautomator2。")
+        tip = ("选择点击/滑动时使用的方案，速度越快脚本反应越灵敏。\n\n"
+               "• ADB：系统自带方式，兼容性最好但较慢。\n"
+               "• minitouch：速度最快。\n"
+               "• uiautomator2：速度较快，滑动速度慢。")
         self.create_info_icon(f_ctrl, tip).pack(side=LEFT, padx=5)
 
-        ttkb.Label(body, text="截图方式", font=("bold")).pack(anchor="w")
+        ttkb.Label(body, text="截图方式（对整体运行速度影响最大）", font=("bold")).pack(anchor="w")
         f_scshot = ttkb.Frame(body)
         f_scshot.pack(fill=X, pady=5)
         scshot_method = ttkb.Combobox(f_scshot, values=("ADB", "nemu_ipc", "uiautomator2", "DroidCast_raw"), state="readonly", width=16)
@@ -701,7 +901,11 @@ class Application(ttkb.Window):
         else:
             scshot_method.current(0)
         self.create_info_icon(f_scshot,
-            "nemu_ipc：仅 MuMu 可用，速度极快。\nDroidCast_raw：需 assets/DroidCast_raw.apk。\nuiautomator2：需 pip install uiautomator2。\nADB：兼容性最好，速度较慢。").pack(side=LEFT, padx=5)
+            "选择获取屏幕画面的方式；截图越慢，整体运行越慢，建议优先选快的。\n\n"
+            "• nemu_ipc：仅 MuMu 模拟器可用，速度极快。\n"
+            "• uiautomator2：速度次快。\n"
+            "• DroidCast_raw：速度较慢。\n"
+            "• ADB：系统自带方式，兼容性最好但最慢。").pack(side=LEFT, padx=5)
 
         ttkb.Separator(body).pack(fill=X, pady=15)
         ttkb.Label(body, text="速度优化（风险选项）", font=("bold")).pack(anchor="w")
@@ -741,7 +945,7 @@ class Application(ttkb.Window):
         e_max.pack(side=LEFT, padx=5)
         e_max.insert(0, str(self.config.get("slide_max", 500)))
         self.create_info_icon(f_s,
-                              "控制地勤分配界面中滑块操作的持续时间。\n建议范围 200-800ms，\n时间越长越像真人，但效率会降低。").pack(
+                              "控制地勤分配界面中滑块操作的持续时间。\n建议范围 200-500ms。\n若最低值小于200，可能出现地勤分配时滑动不到位的情况").pack(
             side=LEFT, padx=5)
 
         f_t = ttkb.Frame(body);
