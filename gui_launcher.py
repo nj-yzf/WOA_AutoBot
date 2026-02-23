@@ -56,26 +56,22 @@ _ICON_DIR = "icon"
 
 CONFIG_FILE = "config.json"
 
-def handle_exception(exc_type, exc_value, exc_traceback):
-    """全局未捕获异常处理，生成崩溃日志"""
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-
-    # 生成调试目录
+def _write_crash_report(exc_type, exc_value, exc_traceback):
+    """写入崩溃报告文件，返回文件路径。任何阶段出错都不抛异常。"""
+    crash_log_path = None
     try:
         from adb_controller import get_woa_debug_dir
         debug_dir = get_woa_debug_dir()
         os.makedirs(debug_dir, exist_ok=True)
         crash_log_path = os.path.join(debug_dir, f"crash_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
     except Exception:
-        # 失败则退而求其次
-        crash_log_path = f"crash_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        try:
+            crash_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"crash_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        except Exception:
+            crash_log_path = f"crash_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
-    # 尝试获取最后的日志缓冲
     last_logs = ""
     try:
-        # sys.stdout 应该是 MultiTextRedirector 或 TeeToFile
         if hasattr(sys.stdout, "log_buffer"):
             last_logs = "\n".join(list(sys.stdout.log_buffer))
         elif hasattr(sys.stdout, "stream") and hasattr(sys.stdout.stream, "log_buffer"):
@@ -83,32 +79,67 @@ def handle_exception(exc_type, exc_value, exc_traceback):
     except Exception:
         pass
 
-    # 写入报告
-    with open(crash_log_path, "w", encoding="utf-8") as f:
-        f.write("=== WOA AutoBot CRASH REPORT ===\n")
-        f.write(f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write("--- EXCEPTION STACK TRACE ---\n")
-        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
-        f.write("\n--- LAST PRESERVED LOGS ---\n")
-        if last_logs:
-            f.write(last_logs)
-        else:
-            f.write("(No logs preserved in buffer)")
-        f.write("\n\n=== END REPORT ===\n")
-
-    # 打印到控制台
-    print(f"\n🛑 [严重错误] 脚本发生异常退出，详细日志已保存至: {crash_log_path}")
-    traceback.print_exception(exc_type, exc_value, exc_traceback)
-    
-    # 弹出错误窗口
     try:
-        messagebox.showerror("程序崩溃", f"脚本发生严重错误，已保存详细日志到: {crash_log_path}")
-    except:
+        with open(crash_log_path, "w", encoding="utf-8") as f:
+            f.write("=== WOA AutoBot CRASH REPORT ===\n")
+            f.write(f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Thread: {threading.current_thread().name}\n\n")
+            f.write("--- EXCEPTION STACK TRACE ---\n")
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+            f.write("\n--- LAST PRESERVED LOGS ---\n")
+            f.write(last_logs if last_logs else "(No logs preserved in buffer)")
+            f.write("\n\n=== END REPORT ===\n")
+    except Exception:
+        crash_log_path = None
+    return crash_log_path
+
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """全局未捕获异常处理，生成崩溃日志"""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    crash_log_path = _write_crash_report(exc_type, exc_value, exc_traceback)
+
+    try:
+        if crash_log_path:
+            print(f"\n🛑 [严重错误] 脚本发生异常退出，详细日志已保存至: {crash_log_path}")
+        traceback.print_exception(exc_type, exc_value, exc_traceback)
+    except Exception:
         pass
 
+    is_main = (threading.current_thread() is threading.main_thread())
+    if is_main:
+        try:
+            messagebox.showerror("程序崩溃", f"脚本发生严重错误，已保存详细日志到: {crash_log_path}")
+        except Exception:
+            pass
 
-# 设置全局异常钩子
+
+def _thread_excepthook(args):
+    """Python 3.8+ 子线程未捕获异常兜底"""
+    if args.exc_type is SystemExit:
+        return
+    handle_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+
 sys.excepthook = handle_exception
+threading.excepthook = _thread_excepthook
+
+try:
+    import faulthandler as _fh
+    _crash_fd = None
+    try:
+        from adb_controller import get_woa_debug_dir as _get_dbg
+        _dbg_dir = _get_dbg()
+        os.makedirs(_dbg_dir, exist_ok=True)
+        _crash_fd = open(os.path.join(_dbg_dir, "crash_segfault.log"), "a", encoding="utf-8")
+    except Exception:
+        pass
+    _fh.enable(file=_crash_fd if _crash_fd else sys.stderr, all_threads=True)
+except Exception:
+    pass
 
 
 # === 增强型日志重定向器 ===
@@ -165,16 +196,14 @@ class MultiTextRedirector(object):
 
                 # 日志长度控制：超过1000行自动删除最旧的
                 try:
-                    # 获取总行数，如果大于1000则删除第一行
-                    # index 'end-1c' 是最后一个字符的位置，行号在前
                     if int(w.index('end-1c').split('.')[0]) > 1000:
                         w.delete("1.0", "2.0")
-                except:
+                except Exception:
                     pass
 
                 w.see("end")
                 w.configure(state="disabled")
-            except:
+            except Exception:
                 pass
 
     def flush(self):
@@ -274,7 +303,7 @@ class Application(ttkb.Window):
         self.after(self.queue_check_interval, self.process_log_queue)
 
         def _emit_notice():
-            m1 = "本脚本为开源免费脚本。此脚本完全免费，如您从任何渠道购买获得，请尝试退款。"
+            m1 = "此脚本为开源免费项目，如您从任何渠道购买获得，请尝试退款。"
             m2 = "获取更新和反馈问题请加入QQ群1067076460。"
             print(m1)
             print(m2)

@@ -125,7 +125,7 @@ class SimpleOCR:
             avail = total - used
             if avail < 0: return None
             return used, total, avail
-        except:
+        except Exception:
             return None
 
     def parse_cost(self, text):
@@ -140,7 +140,7 @@ class SimpleOCR:
             if cost == 0: return 10
             if cost < 0 or cost > 25: return None
             return cost
-        except:
+        except Exception:
             return None
 
 
@@ -280,14 +280,14 @@ class WoaBot:
         try:
             b, g, r = screen[y, x]
             return self._color_diff((b, g, r), self.COLOR_LIGHT) < 80
-        except:
+        except Exception:
             return False
 
     def _is_pixel_dark(self, screen, x, y):
         try:
             b, g, r = screen[y, x]
             return self._color_diff((b, g, r), self.COLOR_DARK) < 80
-        except:
+        except Exception:
             return False
 
     def _is_tower_off(self, screen):
@@ -298,7 +298,7 @@ class WoaBot:
                 b, g, r = screen[y, x]
                 if self._color_diff((b, g, r), (tb, tg, tr)) > 70:
                     return False
-            except:
+            except Exception:
                 return False
         return True
 
@@ -518,7 +518,7 @@ class WoaBot:
 
         try:
             res = cv2.matchTemplate(screen_roi, template, cv2.TM_CCOEFF_NORMED)
-        except:
+        except Exception:
             return []
 
         h, w = template.shape[:2]
@@ -780,6 +780,7 @@ class WoaBot:
                 self.adb.run_all_method_tests()
                 woa_debug_set_runtime_started()
                 self.log(">>> [WOA_DEBUG] 方案测试完成，开始主循环")
+                os.environ.pop("WOA_DEBUG", None)
             thread = threading.Thread(target=self._main_loop)
             thread.daemon = True
             thread.start()
@@ -810,12 +811,23 @@ class WoaBot:
     def _main_loop(self):
         try:
             self._do_main_loop()
+        except StopSignal:
+            pass
+        except BaseException:
+            self._write_thread_crash_report()
+            traceback.print_exc()
+
+    def _write_thread_crash_report(self):
+        """从工作线程安全地写入崩溃报告（不碰 tkinter）"""
+        try:
+            from gui_launcher import _write_crash_report
+            exc_type, exc_value, exc_tb = sys.exc_info()
+            if exc_type:
+                path = _write_crash_report(exc_type, exc_value, exc_tb)
+                if path:
+                    self.log(f"🛑 [严重错误] 脚本异常退出，日志已保存至: {path}")
         except Exception:
-            # 这里的异常会触发全局异常钩子
-            if hasattr(sys, 'excepthook'):
-                sys.excepthook(*sys.exc_info())
-            else:
-                traceback.print_exc()
+            traceback.print_exc()
 
     def _do_main_loop(self):
         self.log("[DEBUG] 主循环线程已启动")
@@ -837,7 +849,7 @@ class WoaBot:
                         self.close_window()
                         idle_count = 0
                 gc_counter += 1
-                if gc_counter > 200:
+                if gc_counter > 50:
                     gc.collect()
                     gc_counter = 0
             except StopSignal:
@@ -856,17 +868,15 @@ class WoaBot:
                 
                 if self.consecutive_errors >= 6:
                     self.log("🛑 检测到持续报错，脚本将终止运行以防止僵死状态")
-                    # 主动调用全局异常处理逻辑（通过 sys.excepthook）
-                    if hasattr(sys, 'excepthook'):
-                        exc_type, exc_value, exc_traceback = sys.exc_info()
-                        if exc_type:
-                            sys.excepthook(exc_type, exc_value, exc_traceback)
+                    self._write_thread_crash_report()
                     self.running = False
                     break
                 
                 try:
                     self.sleep(3.0)
-                except:
+                except (StopSignal, KeyboardInterrupt, SystemExit):
+                    break
+                except Exception:
                     break
             else:
                 # 如果成功运行一轮，重置连续错误计数
@@ -1045,7 +1055,7 @@ class WoaBot:
                 if self._is_point_red(int(b), int(g), int(r)):
                     is_triggered = True
                     break
-            except:
+            except Exception:
                 pass
         if is_triggered:
             self.log(f"🚨 [最高优] 监测到自动塔台红灯...")
@@ -1567,7 +1577,9 @@ class WoaBot:
             self.adb.click(det['center'][0] + 60, det['center'][1], random_offset=3)
             try:
                 return det['handler']()
-            except:
+            except (StopSignal, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
                 return det['handler'](None)
 
         valid_candidates = []
@@ -1613,5 +1625,7 @@ class WoaBot:
         self.adb.click(selected_task['center'][0] + 60, selected_task['center'][1], random_offset=3)
         try:
             return selected_task['handler']()
-        except:
+        except (StopSignal, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
             return selected_task['handler'](None)

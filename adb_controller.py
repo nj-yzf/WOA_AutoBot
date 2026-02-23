@@ -430,6 +430,7 @@ class AdbController:
         self._nemu_ipc_instance_id = None
         self._nemu_ipc_logged = None  # "ok"/"fail" 用于避免重复日志
         self._nemu_ipc_pixel_format = None  # auto 检测后缓存的 "rgba" 或 "bgra"
+        self._nemu_ipc_executor = None  # 复用的 ThreadPoolExecutor
         self.mumu_path = ""  # 手动指定的 MuMu 安装路径，留空则自动检测
         self._nemu_folder_callback = None  # 自动识别成功时回调 (folder) -> None
 
@@ -821,6 +822,12 @@ class AdbController:
             except Exception:
                 pass
             self._nemu_ipc_connect_id = 0
+        if self._nemu_ipc_executor:
+            try:
+                self._nemu_ipc_executor.shutdown(wait=False)
+            except Exception:
+                pass
+            self._nemu_ipc_executor = None
         self._nemu_ipc_pixel_format = None
         acquired = self.shell_lock.acquire(timeout=1.0)
         try:
@@ -1054,9 +1061,20 @@ class AdbController:
                 print(f">>> [扫描调试] start-server 异常: {e}")
         time.sleep(0.2)
 
-        # MuMuManager 连接 MuMu 实例 0、1、2（并发启动，提速）
+        # MuMuManager 连接已存在的 MuMu 实例（仅连接 vms 中实际存在的，避免自动创建新设备）
         mumu_adb = AdbController._find_mumu_adb()
         if mumu_adb and os.path.isfile(mumu_adb):
+            existing_ids = set()
+            try:
+                from emulator_discovery import get_mumu_serials_from_vms, _mum12_id_from_name
+                for _, name, _ in get_mumu_serials_from_vms():
+                    mid = _mum12_id_from_name(name)
+                    if mid is not None:
+                        existing_ids.add(mid)
+            except Exception:
+                pass
+            if not existing_ids:
+                existing_ids = {0}
             mumu_base = os.path.dirname(mumu_adb)
             for manager_name in ["MuMuManager.exe", "MuMuManager"]:
                 manager_path = os.path.join(mumu_base, manager_name)
@@ -1064,7 +1082,7 @@ class AdbController:
                     manager_path = os.path.join(os.path.dirname(mumu_base), "shell", manager_name)
                 if os.path.isfile(manager_path):
                     cwd = os.path.dirname(manager_path)
-                    for instance_id in [0, 1, 2]:
+                    for instance_id in sorted(existing_ids):
                         try:
                             subprocess.Popen([manager_path, "adb", "-v", str(instance_id), "connect"],
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1072,18 +1090,25 @@ class AdbController:
                         except Exception:
                             pass
                     if debug:
-                        print(f">>> [扫描调试] 已启动 MuMuManager 连接实例 0/1/2")
+                        print(f">>> [扫描调试] 已启动 MuMuManager 连接实例 {sorted(existing_ids)}")
                     break
 
         # 用当前扫描用 adb 对全部端口执行 connect
+        _scan_procs = []
         for port in all_ports:
             try:
-                subprocess.Popen([scan_adb, "connect", f"127.0.0.1:{port}"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 creationflags=creationflags)
+                p = subprocess.Popen([scan_adb, "connect", f"127.0.0.1:{port}"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     creationflags=creationflags)
+                _scan_procs.append(p)
             except Exception:
                 pass
         time.sleep(1.5)
+        for p in _scan_procs:
+            try:
+                p.wait(timeout=0.1)
+            except Exception:
+                pass
         devices = _devices_list()
         # 去重并保持顺序（127.0.0.1:xxx 与 emulator-xxxx 可能同时存在，保留用户可读的）
         seen = set()
@@ -1466,45 +1491,47 @@ class AdbController:
                 if self._nemu_ipc_logged != "ok":
                     self._nemu_ipc_logged = "ok"
                     print(">>> [nemu_ipc] 已启用，仅 MuMu 可用，速度极快")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                # 1. 获取分辨率
-                w_ptr = ctypes.pointer(ctypes.c_int(0))
-                h_ptr = ctypes.pointer(ctypes.c_int(0))
-                future = executor.submit(
-                    self._nemu_ipc_lib.nemu_capture_display,
-                    self._nemu_ipc_connect_id, 0, 0, w_ptr, h_ptr, None
-                )
-                try:
-                    ret = future.result(timeout=0.5)
-                except concurrent.futures.TimeoutError:
-                    _woa_debug_log("nemu_ipc get_resolution timeout")
-                    return None
-                
-                if ret > 0:
-                    self._nemu_ipc_connect_id = 0 # 失败后强制下次重连
-                    return None
-                width, height = w_ptr.contents.value, h_ptr.contents.value
-                if width <= 0 or height <= 0:
-                    self._nemu_ipc_connect_id = 0
-                    return None
+            if self._nemu_ipc_executor is None:
+                self._nemu_ipc_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            executor = self._nemu_ipc_executor
+            # 1. 获取分辨率
+            w_ptr = ctypes.pointer(ctypes.c_int(0))
+            h_ptr = ctypes.pointer(ctypes.c_int(0))
+            future = executor.submit(
+                self._nemu_ipc_lib.nemu_capture_display,
+                self._nemu_ipc_connect_id, 0, 0, w_ptr, h_ptr, None
+            )
+            try:
+                ret = future.result(timeout=0.5)
+            except concurrent.futures.TimeoutError:
+                _woa_debug_log("nemu_ipc get_resolution timeout")
+                return None
+            
+            if ret > 0:
+                self._nemu_ipc_connect_id = 0
+                return None
+            width, height = w_ptr.contents.value, h_ptr.contents.value
+            if width <= 0 or height <= 0:
+                self._nemu_ipc_connect_id = 0
+                return None
 
-                # 2. 获取像素数据
-                length = width * height * 4
-                buf = (ctypes.c_ubyte * length)()
-                future = executor.submit(
-                    self._nemu_ipc_lib.nemu_capture_display,
-                    self._nemu_ipc_connect_id, 0, length, w_ptr, h_ptr, ctypes.byref(buf)
-                )
-                try:
-                    ret = future.result(timeout=1.0)
-                except concurrent.futures.TimeoutError:
-                    _woa_debug_log("nemu_ipc screenshot timeout")
-                    self._nemu_ipc_connect_id = 0
-                    return None
+            # 2. 获取像素数据
+            length = width * height * 4
+            buf = (ctypes.c_ubyte * length)()
+            future = executor.submit(
+                self._nemu_ipc_lib.nemu_capture_display,
+                self._nemu_ipc_connect_id, 0, length, w_ptr, h_ptr, ctypes.byref(buf)
+            )
+            try:
+                ret = future.result(timeout=1.0)
+            except concurrent.futures.TimeoutError:
+                _woa_debug_log("nemu_ipc screenshot timeout")
+                self._nemu_ipc_connect_id = 0
+                return None
 
-                if ret > 0:
-                    self._nemu_ipc_connect_id = 0
-                    return None
+            if ret > 0:
+                self._nemu_ipc_connect_id = 0
+                return None
             arr = np.ctypeslib.as_array(buf).reshape((height, width, 4)).copy()
             # 像素格式：auto=与 ADB 比对自动检测，rgba/bgra=手动指定
             fmt_env = os.environ.get("NEMU_IPC_PIXEL_FORMAT", "auto").lower()
@@ -1982,6 +2009,8 @@ class AdbController:
     def _read_image_safe(self, path):
         return read_image_safe(path)
 
+    _template_cache = {}
+
     def locate_image(self, template_path, confidence=0.8, screen_image=None):
         import cv2
         if screen_image is not None:
@@ -1989,8 +2018,11 @@ class AdbController:
         else:
             screen = self.get_screenshot()
         if screen is None: return None
-        template = self._read_image_safe(template_path)
-        if template is None: return None
+        template = self._template_cache.get(template_path)
+        if template is None:
+            template = self._read_image_safe(template_path)
+            if template is None: return None
+            self._template_cache[template_path] = template
         result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
         min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
         if max_val >= confidence:
@@ -2006,8 +2038,11 @@ class AdbController:
         else:
             screen = self.get_screenshot()
         if screen is None: return []
-        template = self._read_image_safe(template_path)
-        if template is None: return []
+        template = self._template_cache.get(template_path)
+        if template is None:
+            template = self._read_image_safe(template_path)
+            if template is None: return []
+            self._template_cache[template_path] = template
         result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
         h, w = template.shape[:2]
         loc = np.where(result >= confidence)
