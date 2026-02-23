@@ -386,6 +386,7 @@ class AdbController:
 
     def __init__(self, target_device=None, use_minitouch=False, screenshot_method="adb", control_method=None):
         self.device_serial = target_device
+        self.adb_path = CURRENT_ADB_PATH or "adb"
         if control_method is not None:
             m = (control_method or "adb").lower()
             self.control_method = m if m in self.VALID_CONTROL_METHODS else "adb"
@@ -395,6 +396,12 @@ class AdbController:
         self.screenshot_method = (screenshot_method or "adb").lower()
         if self.screenshot_method not in ("adb", "nemu_ipc", "uiautomator2", "droidcast_raw"):
             self.screenshot_method = "adb"
+        self._desired_screenshot_method = self.screenshot_method
+        self._desired_control_method = self.control_method
+        self._screenshot_consec_fails = 0
+        self._control_consec_fails = 0
+        self._last_screenshot_recovery_time = 0.0
+        self._last_control_recovery_time = 0.0
         self.think_min = 0.0
         self.think_max = 0.0
         _adb_instances.append(self)
@@ -445,11 +452,14 @@ class AdbController:
         self.think_min = float(min_s)
         self.think_max = float(max_s)
 
-    def set_control_method(self, method):
+    def set_control_method(self, method, _is_fallback=False):
         m = (method or "adb").lower()
         if m in self.VALID_CONTROL_METHODS:
             self.control_method = m
             self.use_minitouch = (m == "minitouch")
+            if not _is_fallback:
+                self._desired_control_method = m
+                self._control_consec_fails = 0
 
     def _u2_ensure_assets(self, u2_module):
         """确保 u2.jar 可被 uiautomator2 找到，并打补丁（兼容打包后）"""
@@ -475,10 +485,13 @@ class AdbController:
         except Exception:
             pass
 
-    def set_screenshot_method(self, method):
+    def set_screenshot_method(self, method, _is_fallback=False):
         m = (method or "adb").lower()
         if m in ("adb", "nemu_ipc", "uiautomator2", "droidcast_raw"):
             self.screenshot_method = m
+            if not _is_fallback:
+                self._desired_screenshot_method = m
+                self._screenshot_consec_fails = 0
 
     def set_mumu_path(self, path):
         self.mumu_path = (path or "").strip()
@@ -549,7 +562,7 @@ class AdbController:
                 if self.shell_process and self.shell_process.poll() is None:
                     return  # 依然存活
 
-                adb = CURRENT_ADB_PATH or "adb"
+                adb = self.adb_path
                 cmd = [adb, "-s", self.device_serial, "shell"]
                 # 建立一个长连接管道，stdin 用于写入命令
                 self.shell_process = subprocess.Popen(
@@ -778,7 +791,7 @@ class AdbController:
         if self._minitouch_proc:
             try:
                 self._minitouch_proc.terminate()
-                self._minitouch_proc.wait(timeout=2.0)
+                self._minitouch_proc.wait(timeout=0.5)
             except Exception:
                 try:
                     self._minitouch_proc.kill()
@@ -789,7 +802,7 @@ class AdbController:
         if getattr(self, "_droidcast_proc", None):
             try:
                 self._droidcast_proc.terminate()
-                self._droidcast_proc.wait(timeout=2.0)
+                self._droidcast_proc.wait(timeout=0.5)
             except Exception:
                 try:
                     self._droidcast_proc.kill()
@@ -798,7 +811,10 @@ class AdbController:
             self._droidcast_proc = None
         self._droidcast_session = None
         self._droidcast_port = 0
-        self.run_cmd(["forward", "--remove", "tcp:53516"], timeout=3)
+        try:
+            self.run_cmd(["forward", "--remove", "tcp:53516"], timeout=1)
+        except Exception:
+            pass
         if self._nemu_ipc_connect_id and self._nemu_ipc_lib:
             try:
                 self._nemu_ipc_lib.nemu_disconnect(self._nemu_ipc_connect_id)
@@ -806,7 +822,8 @@ class AdbController:
                 pass
             self._nemu_ipc_connect_id = 0
         self._nemu_ipc_pixel_format = None
-        with self.shell_lock:
+        acquired = self.shell_lock.acquire(timeout=1.0)
+        try:
             if not self.shell_process:
                 return
             try:
@@ -818,14 +835,20 @@ class AdbController:
                         pass
                     self.shell_process.terminate()
                     try:
-                        self.shell_process.wait(timeout=2.0)
+                        self.shell_process.wait(timeout=0.5)
                     except subprocess.TimeoutExpired:
                         self.shell_process.kill()
-                        self.shell_process.wait(timeout=1.0)
+                        try:
+                            self.shell_process.wait(timeout=0.5)
+                        except Exception:
+                            pass
             except Exception:
                 pass
             finally:
                 self.shell_process = None
+        finally:
+            if acquired:
+                self.shell_lock.release()
 
     def _write_shell_cmd(self, cmd_str):
         """通过长连接快速写入命令"""
@@ -855,7 +878,7 @@ class AdbController:
 
     def run_cmd(self, args, timeout=15):
         """普通一次性命令 (用于非交互式指令，如 pull/push/connect)"""
-        cmd_list = [CURRENT_ADB_PATH or "adb"]
+        cmd_list = [self.adb_path]
         if self.device_serial:
             cmd_list.extend(["-s", self.device_serial])
 
@@ -1194,7 +1217,7 @@ class AdbController:
                             pass
                         return folder, index
         # 回退2：从当前 ADB 路径推断 MuMu 根目录（部分安装如 C:\Program Files\Netease\MuMu 未被 vms 枚举）
-        adb_path = CURRENT_ADB_PATH if CURRENT_ADB_PATH and os.path.isfile(CURRENT_ADB_PATH) else None
+        adb_path = self.adb_path if self.adb_path and os.path.isfile(self.adb_path) else None
         if adb_path and "nx_main" in adb_path.replace("\\", "/") and "Netease" in adb_path:
             mumu_root = os.path.dirname(os.path.dirname(os.path.abspath(adb_path)))
             if "MuMuPlayerGlobal" in mumu_root:
@@ -1537,7 +1560,7 @@ class AdbController:
                     self._droidcast_fallback_logged = True
                     print(">>> [DroidCast_raw] 推送 APK 失败，回退到 ADB")
                 return False
-            adb_path = CURRENT_ADB_PATH if CURRENT_ADB_PATH and os.path.isfile(CURRENT_ADB_PATH) else None
+            adb_path = self.adb_path if self.adb_path and os.path.isfile(self.adb_path) else None
             if not adb_path:
                 adb_path = get_bundled_resource_path(os.path.join("adb_tools", "adb.exe"))
             adb_path = adb_path if adb_path and os.path.isfile(adb_path) else "adb"
@@ -1664,6 +1687,11 @@ class AdbController:
         except Exception:
             return None
 
+    _SCREENSHOT_MAX_CONSEC_FAILS = 3
+    _SCREENSHOT_RECOVERY_INTERVAL = 120
+    _CONTROL_MAX_CONSEC_FAILS = 3
+    _CONTROL_RECOVERY_INTERVAL = 120
+
     def get_screenshot(self, force_method=None):
         """force_method: 可选 'adb'，强制使用 ADB 截图（用于 nemu_ipc 检测异常时回退）"""
         import cv2
@@ -1673,6 +1701,16 @@ class AdbController:
         if not self.device_serial:
             _woa_debug_log("get_screenshot 无 device_serial 返回 None")
             return None
+
+        if force_method != "adb" and self._desired_screenshot_method != "adb" \
+                and self.screenshot_method != self._desired_screenshot_method:
+            now = time.time()
+            if now - self._last_screenshot_recovery_time > self._SCREENSHOT_RECOVERY_INTERVAL:
+                self._last_screenshot_recovery_time = now
+                self.screenshot_method = self._desired_screenshot_method
+                self._screenshot_consec_fails = 0
+                print(f">>> [模式] 尝试恢复截图方案: {self._desired_screenshot_method}")
+
         use_nemu = (self.screenshot_method == "nemu_ipc" and force_method != "adb")
         use_u2 = (self.screenshot_method == "uiautomator2" and force_method != "adb")
         use_droidcast = (self.screenshot_method == "droidcast_raw" and force_method != "adb")
@@ -1683,61 +1721,68 @@ class AdbController:
                 msg += f"（原因: {reason}）"
             print(msg)
 
+        def _handle_screenshot_degrade(from_m, to_m, reason=""):
+            self._screenshot_consec_fails += 1
+            if self._screenshot_consec_fails >= self._SCREENSHOT_MAX_CONSEC_FAILS:
+                self.set_screenshot_method(to_m, _is_fallback=True)
+                _log_screenshot_fallback(from_m, to_m, reason)
+                self._last_screenshot_recovery_time = time.time()
+
         if use_droidcast:
             img = self._get_screenshot_droidcast_raw()
             if img is not None:
+                self._screenshot_consec_fails = 0
                 _woa_debug_log("get_screenshot 成功 droidcast_raw")
                 _woa_debug_save_screenshot(img, "droidcast_raw")
                 return img
             _woa_debug_log("get_screenshot droidcast_raw 失败，尝试 uiautomator2")
             img = self._get_screenshot_u2(as_fallback=True)
             if img is not None:
-                self.set_screenshot_method("uiautomator2")
+                self.set_screenshot_method("uiautomator2", _is_fallback=True)
                 _log_screenshot_fallback("droidcast_raw", "uiautomator2", "droidcast_raw 截图失败，u2 回退成功")
                 _woa_debug_log("get_screenshot 成功 uiautomator2(回退)")
                 _woa_debug_save_screenshot(img, "u2")
                 return img
-            self.set_screenshot_method("adb")
-            _log_screenshot_fallback("droidcast_raw", "adb", "droidcast_raw 与 u2 均失败")
+            _handle_screenshot_degrade("droidcast_raw", "adb", "droidcast_raw 与 u2 均失败")
             _woa_debug_log("get_screenshot droidcast_raw 回退链结束，使用 ADB")
 
         if use_u2:
             img = self._get_screenshot_u2()
             if img is not None:
+                self._screenshot_consec_fails = 0
                 _woa_debug_log("get_screenshot 成功 uiautomator2")
                 _woa_debug_save_screenshot(img, "u2")
                 return img
-            self.set_screenshot_method("adb")
-            _log_screenshot_fallback("uiautomator2", "adb", "uiautomator2 截图失败")
+            _handle_screenshot_degrade("uiautomator2", "adb", "uiautomator2 截图失败")
             _woa_debug_log("get_screenshot uiautomator2 失败，回退 ADB")
 
         if use_nemu:
             if sys.platform != "win32":
                 if self._nemu_ipc_logged != "fail":
                     self._nemu_ipc_logged = "fail"
-                    self.set_screenshot_method("adb")
+                    self.set_screenshot_method("adb", _is_fallback=True)
                     _log_screenshot_fallback("nemu_ipc", "adb", "nemu_ipc 仅支持 Windows")
                     print(">>> [nemu_ipc] 仅支持 Windows，已回退到 ADB 截图")
             else:
                 img = self._get_screenshot_nemu_ipc()
                 if img is not None:
+                    self._screenshot_consec_fails = 0
                     _woa_debug_log("get_screenshot 成功 nemu_ipc")
                     _woa_debug_save_screenshot(img, "nemu_ipc")
                     return img
                 _woa_debug_log("get_screenshot nemu_ipc 失败，尝试 uiautomator2")
                 img = self._get_screenshot_u2(as_fallback=True)
                 if img is not None:
-                    self.set_screenshot_method("uiautomator2")
+                    self.set_screenshot_method("uiautomator2", _is_fallback=True)
                     _log_screenshot_fallback("nemu_ipc", "uiautomator2", "nemu_ipc 截图失败，u2 回退成功")
                     _woa_debug_log("get_screenshot 成功 uiautomator2(回退)")
                     _woa_debug_save_screenshot(img, "u2")
                     return img
-                self.set_screenshot_method("adb")
-                _log_screenshot_fallback("nemu_ipc", "adb", "nemu_ipc 与 u2 均失败")
+                _handle_screenshot_degrade("nemu_ipc", "adb", "nemu_ipc 与 u2 均失败")
                 _woa_debug_log("get_screenshot nemu_ipc 回退链结束，使用 ADB")
 
         def _try_exec_out():
-            adb = CURRENT_ADB_PATH if CURRENT_ADB_PATH else "adb"
+            adb = self.adb_path
             cmd = [adb, "-s", self.device_serial, "exec-out", "screencap", "-p"]
             try:
                 result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8,
@@ -1813,11 +1858,29 @@ class AdbController:
             y += random.uniform(-random_offset, random_offset)
         xi, yi = int(round(x)), int(round(y))
 
+        if self._desired_control_method != "adb" \
+                and self.control_method != self._desired_control_method:
+            now = time.time()
+            if now - self._last_control_recovery_time > self._CONTROL_RECOVERY_INTERVAL:
+                self._last_control_recovery_time = now
+                self.control_method = self._desired_control_method
+                self.use_minitouch = (self._desired_control_method == "minitouch")
+                self._control_consec_fails = 0
+                self._minitouch_ready = False
+                print(f">>> [模式] 尝试恢复触控方案: {self._desired_control_method}")
+
         def _log_control_fallback(from_m, to_m, reason=""):
             msg = f">>> [模式] 触控方案已切换: {from_m} -> {to_m}"
             if reason:
                 msg += f"（原因: {reason}）"
             print(msg)
+
+        def _handle_control_degrade(from_m, reason=""):
+            self._control_consec_fails += 1
+            if self._control_consec_fails >= self._CONTROL_MAX_CONSEC_FAILS:
+                self.set_control_method("adb", _is_fallback=True)
+                _log_control_fallback(from_m, "adb", reason)
+                self._last_control_recovery_time = time.time()
 
         # uiautomator2
         if self.control_method == "uiautomator2":
@@ -1825,6 +1888,7 @@ class AdbController:
             if self._u2_init() and self._u2_device:
                 try:
                     self._u2_device.click(xi, yi)
+                    self._control_consec_fails = 0
                     _woa_debug_log("click 已发送 uiautomator2")
                     return
                 except Exception as e:
@@ -1832,8 +1896,7 @@ class AdbController:
                     if not self._u2_fallback_logged:
                         self._u2_fallback_logged = True
                         print(">>> [uiautomator2] 触控失败，回退到 ADB")
-            self.set_control_method("adb")
-            _log_control_fallback("uiautomator2", "adb", "uiautomator2 触控失败")
+            _handle_control_degrade("uiautomator2", "uiautomator2 触控失败")
             self._adb_click_fallback(xi, yi)
             _woa_debug_log("click 已回退 adb_click_fallback")
             return
@@ -1846,6 +1909,7 @@ class AdbController:
                 _woa_debug_log(f"click 使用 minitouch 屏幕({xi},{yi}) -> minitouch({tx},{ty})")
                 s = f"d 0 {tx} {ty} 50\nc\nu 0\nc\n"
                 if self._minitouch_send(s):
+                    self._control_consec_fails = 0
                     _woa_debug_log("click 已发送 minitouch")
                     return
                 self._minitouch_ready = False
@@ -1853,8 +1917,7 @@ class AdbController:
                 if not getattr(self, '_minitouch_runtime_fallback_logged', False):
                     self._minitouch_runtime_fallback_logged = True
                     print(">>> [minitouch] 触控发送失败，已回退到 ADB")
-            self.set_control_method("adb")
-            _log_control_fallback("minitouch", "adb", "minitouch 发送失败")
+            _handle_control_degrade("minitouch", "minitouch 发送失败")
 
         _woa_debug_log(f"click 使用 adb shell input tap {xi} {yi}")
         self._adb_click_fallback(xi, yi)

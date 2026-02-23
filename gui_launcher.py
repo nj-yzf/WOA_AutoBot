@@ -216,7 +216,7 @@ class TeeToFile:
 class Application(ttkb.Window):
     def __init__(self):
         try:
-            myappid = 'woabot.launcher.v1.2.3b1'
+            myappid = 'woabot.launcher.v1.2.3b2'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except:
             pass
@@ -228,7 +228,7 @@ class Application(ttkb.Window):
         self.style.colors.primary = "#89b0ae"
         self.style.colors.info = "#9cbfdd"
 
-        self.title("WOA AutoBot v1.2.3b1")
+        self.title("WOA AutoBot v1.2.3b2")
         self.geometry("680x850")
         self.last_geometry = "680x850"
         self.is_mini_mode = False
@@ -862,7 +862,11 @@ class Application(ttkb.Window):
         self.bot.start()
 
     def stop_bot(self):
-        if self.bot: self.bot.stop(); self.bot = None
+        bot = self.bot
+        if bot:
+            bot.running = False
+            bot.stop()
+        self.bot = None
         for btn in [self.btn_main_start, self.btn_mini_start]:
             btn.configure(state="normal", text="▶ 启动脚本")
         for btn in [self.btn_main_stop, self.btn_mini_stop]:

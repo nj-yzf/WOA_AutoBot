@@ -796,9 +796,14 @@ class WoaBot:
         self.running = False
         self.log(">>> 正在停止脚本...")
         self.next_bonus_retry_time = 0
+        adb_ref = getattr(self, 'adb', None)
+        if adb_ref:
+            threading.Thread(target=self._async_close_adb, args=(adb_ref,), daemon=True).start()
+
+    @staticmethod
+    def _async_close_adb(adb):
         try:
-            if hasattr(self, 'adb') and self.adb:
-                self.adb.close()
+            adb.close()
         except Exception:
             pass
 
