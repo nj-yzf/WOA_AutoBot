@@ -56,24 +56,80 @@ _ICON_DIR = "icon"
 
 CONFIG_FILE = "config.json"
 
-LOCAL_VERSION = "v1.2.4"
-_GITEE_API_CONTENTS = "https://gitee.com/api/v5/repos/shuang-nagi/WOA_AutoBot/contents/{}?ref=master"
+LOCAL_VERSION = "v1.2.4.1"
+_GITEE_RAW_URL = "https://gitee.com/shuang-nagi/WOA_AutoBot/raw/master/{}"
+_GITEE_API_URL = "https://gitee.com/api/v5/repos/shuang-nagi/WOA_AutoBot/contents/{}?ref=master"
+_GITEE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 
-def _fetch_gitee_text(filename, timeout=6):
-    """通过 Gitee Contents API 获取文本文件内容，失败返回 None"""
+def _parse_version(ver_str):
+    """将 'v1.2.3' / '1.2.3.4' 解析为整数元组 (1,2,3) / (1,2,3,4)，失败返回 ()"""
+    import re
+    m = re.findall(r'\d+', (ver_str or "").strip())
+    return tuple(int(x) for x in m) if m else ()
+
+def _remote_is_newer(remote_ver, local_ver=LOCAL_VERSION):
+    """仅当在线版本严格大于本地版本时返回 True"""
+    r, l = _parse_version(remote_ver), _parse_version(local_ver)
+    return r > l if r and l else False
+
+_gitee_ssl_ctx_cache = None
+
+def _fetch_gitee_text(filename, timeout=10):
+    """从 Gitee 获取文本文件，多策略回退，针对国内网络优化"""
     import urllib.request
     import base64
-    url = _GITEE_API_CONTENTS.format(filename)
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+    import ssl
+    global _gitee_ssl_ctx_cache
+
+    headers = {
+        "User-Agent": _GITEE_UA,
+        "Referer": "https://gitee.com/shuang-nagi/WOA_AutoBot",
+        "Accept": "text/plain, application/json, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Connection": "close",
+    }
+
+    def _try_raw(ctx=None):
+        req = urllib.request.Request(_GITEE_RAW_URL.format(filename), headers=headers)
+        kw = {"timeout": timeout}
+        if ctx is not None:
+            kw["context"] = ctx
+        with urllib.request.urlopen(req, **kw) as resp:
+            return resp.read().decode("utf-8", errors="replace").strip()
+
+    def _try_api(ctx=None):
+        req = urllib.request.Request(_GITEE_API_URL.format(filename), headers=headers)
+        kw = {"timeout": timeout}
+        if ctx is not None:
+            kw["context"] = ctx
+        with urllib.request.urlopen(req, **kw) as resp:
             data = json.loads(resp.read())
             if isinstance(data, dict) and "content" in data:
                 return base64.b64decode(data["content"]).decode("utf-8", errors="replace").strip()
-    except Exception:
-        pass
+        return None
+
+    for attempt in (_try_raw, _try_api):
+        try:
+            result = attempt()
+            if result:
+                return result
+        except Exception:
+            pass
+
+    if _gitee_ssl_ctx_cache is None:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        _gitee_ssl_ctx_cache = ctx
+    for attempt in (_try_raw, _try_api):
+        try:
+            result = attempt(_gitee_ssl_ctx_cache)
+            if result:
+                return result
+        except Exception:
+            pass
+
     return None
 
 def _write_crash_report(exc_type, exc_value, exc_traceback):
@@ -268,7 +324,7 @@ class TeeToFile:
 class Application(ttkb.Window):
     def __init__(self):
         try:
-            myappid = 'woabot.launcher.v1.2.4'
+            myappid = 'woabot.launcher.v1.2.4.1'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except:
             pass
@@ -280,7 +336,7 @@ class Application(ttkb.Window):
         self.style.colors.primary = "#89b0ae"
         self.style.colors.info = "#9cbfdd"
 
-        self.title("WOA AutoBot v1.2.4")
+        self.title("WOA AutoBot v1.2.4.1")
         self.geometry("680x850")
         self.last_geometry = "680x850"
         self.is_mini_mode = False
@@ -648,9 +704,9 @@ class Application(ttkb.Window):
 
     def _check_version_and_popup(self):
         """后台线程：检查版本更新 + 首次弹窗"""
-        remote_ver = _fetch_gitee_text("version.txt", timeout=5)
+        remote_ver = _fetch_gitee_text("version.txt", timeout=8)
         self.after(0, lambda r=remote_ver: self._log_version_check(r))
-        if remote_ver and remote_ver.strip() != LOCAL_VERSION:
+        if remote_ver and _remote_is_newer(remote_ver):
             self.after(0, lambda v=remote_ver.strip(): self._show_update_notice(v))
 
         if not self.config.get("popup_shown"):
