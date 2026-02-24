@@ -56,7 +56,7 @@ _ICON_DIR = "icon"
 
 CONFIG_FILE = "config.json"
 
-LOCAL_VERSION = "v1.2.4.2"
+LOCAL_VERSION = "v1.2.5"
 _GITEE_RAW_URL = "https://gitee.com/shuang-nagi/WOA_AutoBot/raw/master/{}"
 _GITEE_API_URL = "https://gitee.com/api/v5/repos/shuang-nagi/WOA_AutoBot/contents/{}?ref=master"
 _GITEE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -241,6 +241,7 @@ class MultiTextRedirector(object):
         widget.tag_config("highlight", foreground="#fd7e14")
         widget.tag_config("method", foreground="#c9a227")
         widget.tag_config("update", foreground="#e63946", font=("Microsoft YaHei UI", 10, "bold"))
+        widget.tag_config("stats", foreground="#2196F3", font=("Microsoft YaHei UI", 9, "bold"))
 
     def write(self, str_val):
         if self.closing:
@@ -254,7 +255,9 @@ class MultiTextRedirector(object):
         time_prefix = f"[{now_str}] "
 
         tag = "normal"
-        if "[版本更新]" in str_val:
+        if "[统计]" in str_val:
+            tag = "stats"
+        elif "[版本更新]" in str_val:
             tag = "update"
         elif any(x in str_val for x in ["✅", "成功", "恢复", "通过"]):
             tag = "success"
@@ -330,7 +333,7 @@ class TeeToFile:
 class Application(ttkb.Window):
     def __init__(self):
         try:
-            myappid = 'woabot.launcher.v1.2.4.2'
+            myappid = 'woabot.launcher.v1.2.5'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except:
             pass
@@ -342,7 +345,7 @@ class Application(ttkb.Window):
         self.style.colors.primary = "#89b0ae"
         self.style.colors.info = "#9cbfdd"
 
-        self.title("WOA AutoBot v1.2.4.2")
+        self.title("WOA AutoBot v1.2.5")
         self.geometry("680x850")
         self.last_geometry = "680x850"
         self.is_mini_mode = False
@@ -887,6 +890,242 @@ class Application(ttkb.Window):
             self.after(0, _fill)
         threading.Thread(target=_load, daemon=True).start()
 
+    def _open_stats_chart(self):
+        import csv
+        from datetime import datetime, timedelta, date as date_type
+
+        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "woa_stats.csv")
+        if not os.path.isfile(csv_path):
+            messagebox.showinfo("统计图表", "暂无统计数据，请先运行脚本。", parent=self)
+            return
+
+        rows = []
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                for i, row in enumerate(reader):
+                    if i == 0 and row and row[0].strip().lower() == "date":
+                        continue
+                    if len(row) >= 5:
+                        rows.append(row)
+        except Exception as e:
+            messagebox.showerror("统计图表", f"读取 CSV 失败: {e}", parent=self)
+            return
+        if not rows:
+            messagebox.showinfo("统计图表", "暂无统计数据。", parent=self)
+            return
+
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        data = []
+        for row in rows:
+            if row[0] >= cutoff:
+                try:
+                    data.append((row[0], int(row[1]), int(row[2]), int(row[3]), int(row[4])))
+                except (ValueError, IndexError):
+                    pass
+        if not data:
+            messagebox.showinfo("统计图表", "最近 30 天内暂无统计数据。", parent=self)
+            return
+        data.sort(key=lambda r: r[0])
+
+        settings_win = getattr(self, "settings_win", None)
+        if settings_win and settings_win.winfo_exists():
+            settings_win.grab_release()
+
+        win = ttkb.Toplevel(self)
+        win.title("统计图表 (最近 30 天)")
+        win.geometry("780x760")
+        win.transient(self)
+
+        def _on_chart_close():
+            if settings_win and settings_win.winfo_exists():
+                try:
+                    settings_win.grab_set()
+                except tk.TclError:
+                    pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", _on_chart_close)
+
+        data_dict = {r[0]: (r[1], r[2], r[3], r[4]) for r in data}
+
+        today = date_type.today()
+        cutoff_date = today - timedelta(days=30)
+        all_dates = []
+        d = cutoff_date
+        while d <= today:
+            all_dates.append(d.strftime("%Y-%m-%d"))
+            d += timedelta(days=1)
+
+        titles = ["进场飞机 (架次)", "离场飞机 (架次)", "分配地勤 (架次)", "分配地勤 (人次)"]
+        colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
+        col_indices = [0, 1, 2, 3]
+
+        outer = ttkb.Frame(win)
+        outer.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        # 所有图表共享同一个 offset，默认显示最右侧（最新日期）
+        shared_state = {"drawers": []}
+
+        for idx in range(4):
+            vals = []
+            for dt in all_dates:
+                row = data_dict.get(dt)
+                vals.append((row[col_indices[idx]] if row is not None else None))
+            labels = [d[5:] for d in all_dates]
+            self._draw_chart_panel(outer, titles[idx], labels, vals, colors[idx], shared_state)
+
+        win.after(50, lambda: self._center_toplevel_on_parent(win))
+
+    def _draw_chart_panel(self, parent, title, labels, values, color, shared_state=None):
+        frame = ttkb.Labelframe(parent, text=title, padding=5)
+        frame.pack(fill=X, pady=4)
+
+        cw, ch = 740, 140
+        margin_l, margin_r, margin_t, margin_b = 50, 15, 15, 25
+        plot_w = cw - margin_l - margin_r
+        plot_h = ch - margin_t - margin_b
+
+        canvas = tk.Canvas(frame, width=cw, height=ch, bg="white", highlightthickness=0)
+        canvas.pack()
+
+        n = len(values)
+        v_max = max((v for v in values if v is not None), default=1)
+        if v_max == 0:
+            v_max = 1
+
+        y_ticks = 5
+        step = v_max / y_ticks
+        if step < 1:
+            step = 1
+            y_ticks = int(v_max)
+        else:
+            nice_steps = [1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000]
+            for ns in nice_steps:
+                if ns >= step:
+                    step = ns
+                    break
+            v_max = step * y_ticks
+
+        canvas.create_line(margin_l, margin_t, margin_l, ch - margin_b, fill="#cccccc")
+        canvas.create_line(margin_l, ch - margin_b, cw - margin_r, ch - margin_b, fill="#cccccc")
+
+        for i in range(y_ticks + 1):
+            yv = int(step * i)
+            yp = ch - margin_b - (yv / v_max) * plot_h
+            canvas.create_line(margin_l - 3, yp, cw - margin_r, yp, fill="#eeeeee", dash=(2, 4))
+            canvas.create_text(margin_l - 6, yp, text=str(yv), anchor="e", font=("Consolas", 7), fill="#888888")
+
+        if n == 1:
+            spacing = plot_w
+        else:
+            spacing = plot_w / (n - 1)
+
+        visible = max(1, int(plot_w / 48))
+
+        if shared_state is not None:
+            # 初始化共享状态（仅第一次）
+            if "visible" not in shared_state:
+                shared_state["visible"] = visible
+            if "n" not in shared_state:
+                shared_state["n"] = n
+            if "offset" not in shared_state:
+                shared_state["offset"] = max(0, n - visible)
+            state = shared_state
+        else:
+            state = {"offset": max(0, n - visible)}
+
+        def _draw(off):
+            canvas.delete("plotdata")
+            end = min(n, off + visible)
+            seg = list(range(off, end))
+            if not seg:
+                return
+            seg_n = len(seg)
+            sp = (plot_w / (seg_n - 1)) if seg_n > 1 else plot_w
+
+            for si, gi in enumerate(seg):
+                xp = margin_l + si * sp
+                if si % max(1, seg_n // 8) == 0 or si == seg_n - 1:
+                    canvas.create_text(xp, ch - margin_b + 12, text=labels[gi],
+                                       font=("Consolas", 7), fill="#888888", tags="plotdata")
+
+            points = []
+            for si, gi in enumerate(seg):
+                xp = margin_l + si * sp
+                v = values[gi]
+                if v is not None:
+                    yp = ch - margin_b - (v / v_max) * plot_h
+                    points.append((xp, yp, v))
+                else:
+                    yp = ch - margin_b
+                    points.append((xp, yp, 0))
+
+            for i in range(len(points) - 1):
+                x1, y1, v1 = points[i]
+                x2, y2, v2 = points[i + 1]
+                canvas.create_line(x1, y1, x2, y2, fill=color, width=2, tags="plotdata")
+
+            for xp, yp, v in points:
+                canvas.create_oval(xp - 3, yp - 3, xp + 3, yp + 3, fill=color, outline="white",
+                                   width=1, tags="plotdata")
+                if v > 0:
+                    canvas.create_text(xp, yp - 10, text=str(v),
+                                       font=("Consolas", 7), fill=color, tags="plotdata")
+
+        _draw(state["offset"])
+
+        # 注册本图表的重绘回调，供联动使用
+        if shared_state is not None:
+            if "drawers" not in shared_state:
+                shared_state["drawers"] = []
+            shared_state["drawers"].append(lambda: _draw(shared_state["offset"]))
+
+        def _on_scroll(event):
+            if event.delta > 0:
+                state["offset"] = max(0, state["offset"] - 1)
+            else:
+                state["offset"] = min(max(0, n - visible), state["offset"] + 1)
+            # 联动重绘所有图表
+            if isinstance(state, dict) and "drawers" in state:
+                for d in state["drawers"]:
+                    d()
+            else:
+                _draw(state["offset"])
+
+        drag_state = {"x": None}
+
+        def _on_press(event):
+            drag_state["x"] = event.x
+
+        def _on_drag(event):
+            if drag_state["x"] is None:
+                return
+            dx = event.x - drag_state["x"]
+            if abs(dx) > 20:
+                if dx > 0:
+                    state["offset"] = max(0, state["offset"] - 1)
+                else:
+                    state["offset"] = min(max(0, n - visible), state["offset"] + 1)
+                drag_state["x"] = event.x
+                # 联动重绘所有图表
+                if isinstance(state, dict) and "drawers" in state:
+                    for d in state["drawers"]:
+                        d()
+                else:
+                    _draw(state["offset"])
+
+        def _on_release(event):
+            drag_state["x"] = None
+
+        canvas.bind("<MouseWheel>", _on_scroll)
+        canvas.bind("<ButtonPress-1>", _on_press)
+        canvas.bind("<B1-Motion>", _on_drag)
+        canvas.bind("<ButtonRelease-1>", _on_release)
+
     def open_settings_window(self):
         if hasattr(self, 'settings_win') and self.settings_win.winfo_exists():
             self.settings_win.lift()
@@ -894,7 +1133,7 @@ class Application(ttkb.Window):
         win = ttkb.Toplevel(self)
         self.settings_win = win
         win.title("高级设置")
-        win.geometry("540x820")
+        win.geometry("540x880")
         win.transient(self)
         win.grab_set()
         body = ttkb.Frame(win, padding=20)
@@ -1046,7 +1285,7 @@ class Application(ttkb.Window):
                               "在点击操作前增加随机的“发呆”时间，\n模拟人类思考过程，大幅降低检测风险。\n追求极限速度可选择“关闭”。").pack(
             side=LEFT, padx=5)
 
-        ttkb.Separator(body).pack(fill=X, pady=20)
+        ttkb.Separator(body).pack(fill=X, pady=16)
 
         def save():
             old_cfg = dict(self.config)
@@ -1118,7 +1357,10 @@ class Application(ttkb.Window):
             self.sync_all_configs_to_bot(from_advanced_save=True)
             win.destroy()
 
-        ttkb.Button(body, text="保存设置", bootstyle="success", width=20, command=save).pack()
+        ttkb.Button(body, text="📊 统计图表", bootstyle="info-outline", width=20,
+                    command=self._open_stats_chart).pack(pady=(0, 5))
+        ttkb.Separator(body).pack(fill=X, pady=10)
+        ttkb.Button(body, text="保存设置", bootstyle="success", width=20, command=save).pack(pady=(5, 0))
         win.after(50, lambda: self._center_toplevel_on_parent(win))
 
     def refresh_devices(self):

@@ -208,6 +208,11 @@ class WoaBot:
             ((1533, 331), True), ((1537, 403), True), ((1542, 474), False)
         ]
         self.enable_cancel_stand_filter = False
+        self._stat_approach = 0
+        self._stat_depart = 0
+        self._stat_stand_count = 0
+        self._stat_stand_staff = 0
+        self._stat_last_required_cost = None
         self.REGION_STATUS_TITLE = (20, 320, 190, 250)
         self.LIST_ROI_X = 1312
         self.LIST_ROI_W = 60
@@ -808,10 +813,68 @@ class WoaBot:
     def stop(self):
         self.running = False
         self.log(">>> 正在停止脚本...")
+        self._print_session_stats()
+        self._save_stats_to_csv()
         self.next_bonus_retry_time = 0
         adb_ref = getattr(self, 'adb', None)
         if adb_ref:
             threading.Thread(target=self._async_close_adb, args=(adb_ref,), daemon=True).start()
+
+    def _print_session_stats(self):
+        start = getattr(self, "_run_start_time", None)
+        if start is not None:
+            secs = max(0, int(time.time() - start))
+            h, rest = divmod(secs, 3600)
+            m, s = divmod(rest, 60)
+            if h > 0:
+                dur = f"{h}小时{m}分{s}秒"
+            else:
+                dur = f"{m}分{s}秒"
+            self.log(f"[统计] 本次运行时长: {dur}")
+        a, d, sc, ss = self._stat_approach, self._stat_depart, self._stat_stand_count, self._stat_stand_staff
+        if a + d + sc == 0:
+            return
+        self.log(f"[统计] ═══════════════════════════════════")
+        self.log(f"[统计]  ✈ 进场飞机:  {a} 架次")
+        self.log(f"[统计]  ✈ 离场飞机:  {d} 架次")
+        self.log(f"[统计]  ✈ 分配地勤:  {sc} 架次 / {ss} 人次")
+        self.log(f"[统计] ═══════════════════════════════════")
+
+    def _save_stats_to_csv(self):
+        import csv
+        a, d, sc, ss = self._stat_approach, self._stat_depart, self._stat_stand_count, self._stat_stand_staff
+        if a + d + sc == 0:
+            return
+        try:
+            csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "woa_stats.csv")
+            today = time.strftime("%Y-%m-%d")
+            rows = []
+            header = ["date", "approach", "depart", "stand_count", "stand_staff"]
+            if os.path.isfile(csv_path):
+                with open(csv_path, "r", encoding="utf-8-sig") as f:
+                    reader = csv.reader(f)
+                    for i, row in enumerate(reader):
+                        if i == 0 and row and row[0].strip().lower() == "date":
+                            continue
+                        if len(row) >= 5:
+                            rows.append(row)
+            found = False
+            for row in rows:
+                if row[0] == today:
+                    row[1] = str(int(row[1]) + a)
+                    row[2] = str(int(row[2]) + d)
+                    row[3] = str(int(row[3]) + sc)
+                    row[4] = str(int(row[4]) + ss)
+                    found = True
+                    break
+            if not found:
+                rows.append([today, str(a), str(d), str(sc), str(ss)])
+            with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+        except Exception as e:
+            self.log(f"⚠️ 保存统计数据失败: {e}")
 
     @staticmethod
     def _async_close_adb(adb):
@@ -842,6 +905,7 @@ class WoaBot:
             traceback.print_exc()
 
     def _do_main_loop(self):
+        self._run_start_time = time.time()
         self.log("[DEBUG] 主循环线程已启动")
         self.sleep(1.0)
         self.last_periodic_check_time = 0
@@ -1155,6 +1219,8 @@ class WoaBot:
         while time.time() - start_time < approach_timeout:
             self._check_running()
             if self.find_and_click('landing_permitted.png', wait=0):
+                self._stat_approach += 1
+                self.sleep(0.05)
                 return True
             screen = self.adb.get_screenshot()
             if screen is None: continue
@@ -1172,6 +1238,8 @@ class WoaBot:
                     while time.time() - w_start < 2.5:
                         self._check_running()
                         if self.find_and_click('landing_permitted.png', wait=0):
+                            self._stat_approach += 1
+                            self.sleep(0.05)
                             return True
 
                         check_screen = self.adb.get_screenshot()
@@ -1180,9 +1248,11 @@ class WoaBot:
                             bottom_roi = check_screen[by:by + bh, bx:bx + bw]
                             if self.adb.locate_image(self.icon_path + 'landing_prohibited.png', confidence=0.8,
                                                      screen_image=bottom_roi):
+                                self.sleep(0.05)
                                 return True
 
                         time.sleep(0.1)
+                    self.sleep(0.05)
                     return True
                 else:
                     self.log("❌ 找不到确认按钮")
@@ -1245,7 +1315,7 @@ class WoaBot:
                             self.log("🛑 领奖流程卡死")
                             return False
                         self.log("   -> 领奖确认，等待开始检测下一步...")
-                        self.sleep(1.7)
+                        self.sleep(1.6)
                         t3_timeout = 1.0 if sm in ('nemu_ipc', 'uiautomator2') else 2.0
                         t3_start = time.time()
                         while time.time() - t3_start < t3_timeout:
@@ -1259,6 +1329,8 @@ class WoaBot:
                                 res_final = self.adb.locate_image(self.icon_path + final_btn, confidence=0.7,
                                                                   screen_image=s3_roi)
                                 if res_final:
+                                    if final_btn in ('push_back.png', 'taxi_to_runway.png'):
+                                        self._stat_depart += 1
                                     self.adb.click(res_final[0] + bx, res_final[1] + by)
                                     self.log("   -> ✅ 离场动作执行完毕")
                                     return True
@@ -1269,8 +1341,10 @@ class WoaBot:
                             return self.handle_stand_task()
                         self.log("   -> ℹ️ 未检测到绿点，判定为塔台已接管")
                         return True
+                    if btn in ('push_back.png', 'taxi_to_runway.png'):
+                        self._stat_depart += 1
                     self.adb.click(x, y)
-                    self.sleep(0.5)
+                    self.sleep(0.5)          
                     return True
             time.sleep(0.1)
         self.log("⚠️ 离场任务扫描超时")
@@ -1301,6 +1375,7 @@ class WoaBot:
                 is_read_success = False
             cost_text = self.ocr.recognize_number(self.REGION_TASK_COST, mode='task')
             required_cost = self.ocr.parse_cost(cost_text)
+            self._stat_last_required_cost = required_cost
             if required_cost is None:
                 self.log(f"⚠️ 读取花费失败，盲做")
                 if self._perform_stand_action_sequence(force_verify=not is_read_success):
@@ -1484,6 +1559,10 @@ class WoaBot:
                 return False
 
         if self.wait_and_click('start_ground_support.png', timeout=2.0, click_wait=0):
+            self._stat_stand_count += 1
+            cost = self._stat_last_required_cost
+            if cost is not None:
+                self._stat_stand_staff += cost + 1
             self.sleep(0.5)
             return True
         else:
