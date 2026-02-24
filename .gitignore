@@ -25,6 +25,9 @@ __pycache__/
 venv/
 .vscode/
 .idea/
+.cursor/
+.git/
+__pycache__/
 
 # 排除临时文件
 _gen_obf.py
