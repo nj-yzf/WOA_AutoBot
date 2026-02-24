@@ -414,7 +414,7 @@ class AdbController:
 
         # 【核心升级】持久化 Shell 进程
         self.shell_process = None
-        self.shell_lock = threading.Lock()
+        self.shell_lock = threading.RLock()
         self._closed = False
 
         # minitouch（本脚本分辨率 1600x900，参考 ALAS 支持旋转）
@@ -567,20 +567,36 @@ class AdbController:
         try:
             with self.shell_lock:
                 if self.shell_process and self.shell_process.poll() is None:
-                    return  # 依然存活
+                    return
+
+                if self.shell_process:
+                    try:
+                        self.shell_process.terminate()
+                        self.shell_process.wait(timeout=0.5)
+                    except Exception:
+                        try:
+                            self.shell_process.kill()
+                        except Exception:
+                            pass
+                    self.shell_process = None
 
                 adb = self.adb_path
                 cmd = [adb, "-s", self.device_serial, "shell"]
-                # 建立一个长连接管道，stdin 用于写入命令
                 self.shell_process = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,  # 忽略输出以防阻塞
+                    stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    creationflags=0x08000000  # 隐藏窗口
+                    creationflags=0x08000000
                 )
                 print(f">>> [底层] ADB Shell 长连接已建立: {self.device_serial}")
         except Exception as e:
+            if self.shell_process:
+                try:
+                    self.shell_process.kill()
+                except Exception:
+                    pass
+                self.shell_process = None
             print(f"❌ [底层] 建立 Shell 失败: {e}")
 
     def _adb_forward(self, local, remote):
@@ -683,21 +699,27 @@ class AdbController:
                 s.connect(("127.0.0.1", port))
                 s.settimeout(2)
                 out = s.makefile(mode="rb")
-                first = out.readline().decode("utf-8", errors="replace").strip().replace("\r", "")
-                if first and first[:1] in ("v", "^", "$"):
-                    max_x, max_y = 1600, 900
-                    line2 = out.readline().decode("utf-8", errors="replace").strip().replace("\r", "")
-                    if line2.startswith("^"):
-                        parts = line2.split()
-                        if len(parts) >= 5:
-                            max_x, max_y = int(parts[2]), int(parts[3])
-                    out.readline()  # $ pid
-                    self._minitouch_max_x, self._minitouch_max_y = max_x, max_y
-                    self._minitouch_orientation = self._get_minitouch_orientation()
-                    client = s
+                try:
+                    first = out.readline().decode("utf-8", errors="replace").strip().replace("\r", "")
+                    if first and first[:1] in ("v", "^", "$"):
+                        max_x, max_y = 1600, 900
+                        line2 = out.readline().decode("utf-8", errors="replace").strip().replace("\r", "")
+                        if line2.startswith("^"):
+                            parts = line2.split()
+                            if len(parts) >= 5:
+                                max_x, max_y = int(parts[2]), int(parts[3])
+                        out.readline()  # $ pid
+                        self._minitouch_max_x, self._minitouch_max_y = max_x, max_y
+                        self._minitouch_orientation = self._get_minitouch_orientation()
+                        s.settimeout(5.0)
+                        client = s
+                    else:
+                        err_msg = f"首行无效: {first[:60]!r}" if first else "无输出"
+                finally:
+                    out.close()
+                if client is not None:
                     break
                 s.close()
-                err_msg = f"首行无效: {first[:60]!r}" if first else "无输出"
             except (socket.timeout, socket.error, OSError) as e:
                 err_msg = str(e)
                 if s:
@@ -769,16 +791,25 @@ class AdbController:
             self.run_cmd(["shell", "input", "tap", str(xi), str(yi)])
 
     def _minitouch_send(self, text):
-        if not self._minitouch_client:
-            return False
-        try:
-            self._minitouch_client.sendall(text.encode("utf-8"))
-            time.sleep(0.012)
-            return True
-        except Exception:
-            self._minitouch_ready = False
-            self._minitouch_client = None
-            return False
+        with self._minitouch_lock:
+            if not self._minitouch_client:
+                return False
+            try:
+                self._minitouch_client.sendall(text.encode("utf-8"))
+                time.sleep(0.012)
+                return True
+            except (socket.error, OSError, BrokenPipeError):
+                self._minitouch_ready = False
+                try:
+                    self._minitouch_client.close()
+                except Exception:
+                    pass
+                self._minitouch_client = None
+                return False
+            except Exception:
+                self._minitouch_ready = False
+                self._minitouch_client = None
+                return False
 
     def close(self):
         """关闭 Shell 长连接并终止子进程，避免进程残留导致文件夹无法删除"""
@@ -805,6 +836,10 @@ class AdbController:
                 except Exception:
                     pass
             self._minitouch_proc = None
+        try:
+            self.run_cmd(["forward", "--remove", "tcp:17392"], timeout=1)
+        except Exception:
+            pass
         self._u2_device = None
         if getattr(self, "_droidcast_proc", None):
             try:
@@ -882,10 +917,12 @@ class AdbController:
                     time.sleep(0.5)  # 给 ADB 一点缓冲时间
                     self._start_persistent_shell()
                     try:
-                        self.shell_process.stdin.write((cmd_str + "\n").encode('utf-8'))
-                        self.shell_process.stdin.flush()
-                        return True
-                    except:
+                        if self.shell_process and self.shell_process.stdin:
+                            self.shell_process.stdin.write((cmd_str + "\n").encode('utf-8'))
+                            self.shell_process.stdin.flush()
+                            return True
+                        return False
+                    except Exception:
                         return False
             return False
 
@@ -1112,7 +1149,16 @@ class AdbController:
         time.sleep(1.5)
         for p in _scan_procs:
             try:
-                p.wait(timeout=0.1)
+                p.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.terminate()
+                    p.wait(timeout=0.3)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
             except Exception:
                 pass
         devices = _devices_list()
@@ -1510,6 +1556,7 @@ class AdbController:
             try:
                 ret = future.result(timeout=0.5)
             except concurrent.futures.TimeoutError:
+                future.cancel()
                 _woa_debug_log("nemu_ipc get_resolution timeout")
                 return None
             
@@ -1517,11 +1564,10 @@ class AdbController:
                 self._nemu_ipc_connect_id = 0
                 return None
             width, height = w_ptr.contents.value, h_ptr.contents.value
-            if width <= 0 or height <= 0:
+            if width <= 0 or height <= 0 or width > 7680 or height > 4320:
                 self._nemu_ipc_connect_id = 0
                 return None
 
-            # 2. 获取像素数据
             length = width * height * 4
             buf = (ctypes.c_ubyte * length)()
             future = executor.submit(
@@ -1531,6 +1577,7 @@ class AdbController:
             try:
                 ret = future.result(timeout=1.0)
             except concurrent.futures.TimeoutError:
+                future.cancel()
                 _woa_debug_log("nemu_ipc screenshot timeout")
                 self._nemu_ipc_connect_id = 0
                 return None

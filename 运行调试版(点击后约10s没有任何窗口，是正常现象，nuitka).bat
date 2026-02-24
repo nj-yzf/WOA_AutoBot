@@ -2,5 +2,5 @@
 setlocal
 cd /d "%~dp0"
 set WOA_DEBUG=1
-start "" "WOA_AutoBot_v1.2.4.1.exe"
+start "" "WOA_AutoBot_v1.2.4.2.exe"
 endlocal

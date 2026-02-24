@@ -56,7 +56,7 @@ _ICON_DIR = "icon"
 
 CONFIG_FILE = "config.json"
 
-LOCAL_VERSION = "v1.2.4.1"
+LOCAL_VERSION = "v1.2.4.2"
 _GITEE_RAW_URL = "https://gitee.com/shuang-nagi/WOA_AutoBot/raw/master/{}"
 _GITEE_API_URL = "https://gitee.com/api/v5/repos/shuang-nagi/WOA_AutoBot/contents/{}?ref=master"
 _GITEE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -225,7 +225,8 @@ class MultiTextRedirector(object):
             widgets = []
         self.widgets = widgets
         self.tag = tag
-        self.log_buffer = collections.deque(maxlen=200)  # 保留最近200条日志以便发生错误时导出
+        self.log_buffer = collections.deque(maxlen=200)
+        self.closing = False
 
     def add_widget(self, widget):
         if widget not in self.widgets:
@@ -242,6 +243,8 @@ class MultiTextRedirector(object):
         widget.tag_config("update", foreground="#e63946", font=("Microsoft YaHei UI", 10, "bold"))
 
     def write(self, str_val):
+        if self.closing:
+            return
         if "-> 执行动作:" in str_val: return
         if str_val == "\n":
             self._insert_to_all("\n", "normal")
@@ -266,22 +269,25 @@ class MultiTextRedirector(object):
         self._insert_to_all(time_prefix, "time", str_val, tag)
 
     def _insert_to_all(self, txt1, tag1, txt2=None, tag2=None):
+        if self.closing:
+            return
         for w in self.widgets:
             try:
-                if not w.winfo_exists(): continue
+                if not w.winfo_exists():
+                    continue
                 w.configure(state="normal")
                 w.insert("end", txt1, (tag1,))
-                if txt2: w.insert("end", txt2, (tag2,))
-
-                # 日志长度控制：超过1000行自动删除最旧的
+                if txt2:
+                    w.insert("end", txt2, (tag2,))
                 try:
                     if int(w.index('end-1c').split('.')[0]) > 1000:
                         w.delete("1.0", "2.0")
                 except Exception:
                     pass
-
                 w.see("end")
                 w.configure(state="disabled")
+            except (tk.TclError, RuntimeError):
+                pass
             except Exception:
                 pass
 
@@ -324,7 +330,7 @@ class TeeToFile:
 class Application(ttkb.Window):
     def __init__(self):
         try:
-            myappid = 'woabot.launcher.v1.2.4.1'
+            myappid = 'woabot.launcher.v1.2.4.2'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except:
             pass
@@ -336,7 +342,7 @@ class Application(ttkb.Window):
         self.style.colors.primary = "#89b0ae"
         self.style.colors.info = "#9cbfdd"
 
-        self.title("WOA AutoBot v1.2.4.1")
+        self.title("WOA AutoBot v1.2.4.2")
         self.geometry("680x850")
         self.last_geometry = "680x850"
         self.is_mini_mode = False
@@ -408,7 +414,26 @@ class Application(ttkb.Window):
 
     def _on_closing(self):
         """关闭窗口时停止脚本并清理资源，避免进程残留"""
-        self.stop_bot()
+        if getattr(self, "_is_closing", False):
+            return
+        self._is_closing = True
+
+        self.redirector.closing = True
+
+        bot = self.bot
+        if bot:
+            bot.running = False
+            worker = getattr(bot, '_worker_thread', None)
+            if worker and worker.is_alive():
+                worker.join(timeout=2.0)
+            try:
+                adb_ref = getattr(bot, 'adb', None)
+                if adb_ref:
+                    adb_ref.close()
+            except Exception:
+                pass
+        self.bot = None
+
         try:
             close_all_and_kill_server()
         except Exception:
@@ -419,7 +444,10 @@ class Application(ttkb.Window):
             sys.stdout = sys.__stdout__
         except Exception:
             pass
-        self.destroy()
+        try:
+            self.destroy()
+        except Exception:
+            pass
         try:
             self.quit()
         except Exception:
@@ -1156,12 +1184,13 @@ class Application(ttkb.Window):
             bot.running = False
             bot.stop()
         self.bot = None
-        for btn in [self.btn_main_start, self.btn_mini_start]:
-            btn.configure(state="normal", text="▶ 启动脚本")
-        for btn in [self.btn_main_stop, self.btn_mini_stop]:
-            btn.configure(state="disabled")
-        self.combo_devices.configure(state="readonly")
-        print(">>> 脚本已停止")
+        if not getattr(self, "_is_closing", False):
+            for btn in [self.btn_main_start, self.btn_mini_start]:
+                btn.configure(state="normal", text="▶ 启动脚本")
+            for btn in [self.btn_main_stop, self.btn_mini_stop]:
+                btn.configure(state="disabled")
+            self.combo_devices.configure(state="readonly")
+            print(">>> 脚本已停止")
 
     def on_confirm_tower_delay(self):
         self.sync_all_configs_to_bot()

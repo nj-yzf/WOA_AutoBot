@@ -28,3 +28,9 @@ venv/
 
 # 排除临时文件
 _gen_obf.py
+
+build_nuitka.bat
+debug_build_pyinstaller.bat
+create_build_bats.py
+运行调试版(pyinstaller).bat
+运行调试版(点击后约10s没有任何窗口，是正常现象，nuitka).bat

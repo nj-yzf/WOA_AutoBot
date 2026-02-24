@@ -155,6 +155,7 @@ class WoaBot:
         self.adb = None
         self.target_device = None
         self.running = False
+        self._worker_thread = None
         self.log_callback = log_callback
         self.icon_path = get_resource_path('icon') + os.sep
         self.last_staff_shortage_time = 0
@@ -637,9 +638,19 @@ class WoaBot:
     def log(self, message):
         if not message or not str(message).strip():
             return
-        print(message)
+        try:
+            print(message)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            pass
         if self.log_callback:
-            self.log_callback(message)
+            try:
+                self.log_callback(message)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                pass
 
         # 【核心修正】智能防卡死逻辑
         # 1. 过滤掉恢复日志本身，防止递归触发
@@ -783,6 +794,7 @@ class WoaBot:
                 os.environ.pop("WOA_DEBUG", None)
             thread = threading.Thread(target=self._main_loop)
             thread.daemon = True
+            self._worker_thread = thread
             thread.start()
         except Exception as e:
             self.log(f"❌ 启动失败: {e}")
@@ -854,6 +866,8 @@ class WoaBot:
                     gc_counter = 0
             except StopSignal:
                 self.log(">>> [系统] 停止指令，终止...")
+                break
+            except (KeyboardInterrupt, SystemExit):
                 break
             except Exception as e:
                 # 出现异常，打印堆栈
@@ -1267,7 +1281,9 @@ class WoaBot:
         self.sleep(0.1)
         if not self._verify_and_redirect('status_stand.png'): return True
         self.log(">>> [任务] 处理停机位队列...")
-        while True:
+        _stand_deadline = time.time() + 30.0
+        while time.time() < _stand_deadline:
+            self._check_running()
             avail_staff = None
             is_read_success = False
             for _ in range(3):
@@ -1277,7 +1293,7 @@ class WoaBot:
                     is_read_success = True
                     self._update_staff_tracker(val)
                     break
-                time.sleep(0.2)
+                self.sleep(0.2)
             if avail_staff is None:
                 self.log("⚠️ 无法读取地勤人数，尝试盲做")
                 self._update_staff_tracker(None)
@@ -1492,20 +1508,22 @@ class WoaBot:
                 fs_start = time.time()
                 found_step2 = False
                 while time.time() - fs_start < 5.0:
+                    self._check_running()
                     if self.find_and_click('first_start_2.png', wait=0.5):
                         found_step2 = True
                         break
-                    time.sleep(0.5)
+                    self.sleep(0.5)
 
                 if found_step2:
                     self.log("   -> 正在等待返回主界面...")
                     wait_main = time.time()
                     while time.time() - wait_main < 20.0:
+                        self._check_running()
                         if self.safe_locate('main_interface.png', region=self.REGION_MAIN_ANCHOR, confidence=0.8):
                             self.last_seen_main_interface_time = time.time()
                             self.log("   -> ✅ 恢复成功")
                             return
-                        time.sleep(1.0)
+                        self.sleep(1.0)
 
             if self.wait_and_click('back.png', timeout=1.0, click_wait=0.5, random_offset=2):
                 self.log("   -> 点击了 Back 按钮")
@@ -1619,7 +1637,7 @@ class WoaBot:
         time_until_refresh = self.next_list_refresh_time - time.time()
         if 0 < time_until_refresh < 0.8:
             self.sleep(time_until_refresh + 0.5)
-            return self.scan_and_process()
+            return False
 
         self.log(f"识别结果: {selected_task['name']} (分数: {selected_task['score']:.2f})")
         self.adb.click(selected_task['center'][0] + 60, selected_task['center'][1], random_offset=3)
