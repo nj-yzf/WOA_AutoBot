@@ -290,11 +290,11 @@ class MultiTextRedirector(object):
             tag = "stats"
         elif "[版本更新]" in str_val:
             tag = "update"
+        elif any(x in str_val for x in ["⚠️", "警告", "注意", "跳过", "超时"]):
+            tag = "highlight"
         elif any(x in str_val for x in ["✅", "成功", "恢复", "通过"]):
             tag = "success"
         elif any(x in str_val for x in ["🛑", "❌", "错误", "失败", "严重", "卡死"]):
-            tag = "error"
-        elif any(x in str_val for x in ["⚠️", "警告", "注意", "跳过", "超时"]):
             tag = "highlight"
         elif any(x in str_val for x in ["[模式]", "触控方案", "截图方案", "触控:", "截图:"]):
             tag = "method"
@@ -695,7 +695,7 @@ class Application(ttkb.Window):
         ttkb.Button(f_tower, text="确认", bootstyle="outline-success", width=4, padding=0,
                     command=self.on_confirm_tower_delay).pack(side=LEFT, padx=5)
         self.create_info_icon(f_tower,
-                              "填0表示功能关闭，最大值144；\n使用前请手动开启塔台，目前仅支持四个控制器全开，并设置好延时界面；\n你设置的延时时间是多久，脚本一次就延时多久，脚本不会主动修改。\n（实验性功能）").pack(
+                              "填0表示功能关闭，最大值144；\n使用前请手动开启塔台，并设置好延时界面中各项配置；\n支持延时你开启的一个或多个控制器\n你设置的延时时间是多久，脚本一次就延时多久\n你开启哪些控制器，脚本就延时哪些控制器，脚本不会主动修改。\n（实验性功能）").pack(
             side=LEFT)
 
         ctl_frame = ttkb.Frame(self.container_main, padding=main_pad)
@@ -1329,24 +1329,24 @@ class Application(ttkb.Window):
         ttkb.Label(f_switch, text="无任务切换间隔随机范围(s):").pack(side=LEFT)
         e_switch_min = ttkb.Entry(f_switch, width=5)
         e_switch_min.pack(side=LEFT, padx=5)
-        e_switch_min.insert(0, str(self.config.get("filter_switch_min", 3)))
+        e_switch_min.insert(0, str(self.config.get("filter_switch_min", 5)))
         ttkb.Label(f_switch, text="-").pack(side=LEFT)
         e_switch_max = ttkb.Entry(f_switch, width=5)
         e_switch_max.pack(side=LEFT, padx=5)
-        e_switch_max.insert(0, str(self.config.get("filter_switch_max", 6)))
+        e_switch_max.insert(0, str(self.config.get("filter_switch_max", 10)))
         self.create_info_icon(f_switch,
-                              "不起飞模式开启后，无可用任务时，在起飞和停机位两种筛选状态中，来回切换以寻找可用任务的随机时间间隔范围（秒）。\n默认 3-6 秒。").pack(side=LEFT, padx=5)
+                              "不起飞模式开启后，无可用任务时，在起飞和停机位两种筛选状态中，来回切换以寻找可用任务的随机时间间隔范围（秒）。\n默认 5-10 秒。").pack(side=LEFT, padx=5)
 
         f_logout = ttkb.Frame(body)
         f_logout.pack(fill=X, pady=5)
         ttkb.Label(f_logout, text="小退间隔随机范围(分钟):").pack(side=LEFT)
         e_logout_min = ttkb.Entry(f_logout, width=5)
         e_logout_min.pack(side=LEFT, padx=5)
-        e_logout_min.insert(0, str(self.config.get("no_takeoff_logout_min", 0)))
+        e_logout_min.insert(0, str(self.config.get("no_takeoff_logout_min", 20)))
         ttkb.Label(f_logout, text="-").pack(side=LEFT)
         e_logout_max = ttkb.Entry(f_logout, width=5)
         e_logout_max.pack(side=LEFT, padx=5)
-        e_logout_max.insert(0, str(self.config.get("no_takeoff_logout_max", 0)))
+        e_logout_max.insert(0, str(self.config.get("no_takeoff_logout_max", 30)))
         self.create_info_icon(f_logout,
                               "不起飞模式开启后，每隔该随机时长执行一次小退，清空起飞飞机\n（点击左上角菜单->更改机场->开始->等待返回主界面）。\n填 0-0 表示关闭自动小退。单位：分钟。").pack(side=LEFT, padx=5)
 
@@ -1447,8 +1447,8 @@ class Application(ttkb.Window):
                 self.config["filter_switch_min"] = sw_min
                 self.config["filter_switch_max"] = sw_max
             except (ValueError, AttributeError):
-                self.config["filter_switch_min"] = 3
-                self.config["filter_switch_max"] = 6
+                self.config["filter_switch_min"] = 5
+                self.config["filter_switch_max"] = 10
 
             changed = []
             if old_cfg.get("adb_path") != self.config.get("adb_path"):
@@ -1471,10 +1471,10 @@ class Application(ttkb.Window):
                 changed.append(("塔台关闭筛选全部飞机", "开" if self.config.get("cancel_stand_filter") else "关"))
             if (old_cfg.get("no_takeoff_logout_min") != self.config.get("no_takeoff_logout_min") or
                     old_cfg.get("no_takeoff_logout_max") != self.config.get("no_takeoff_logout_max")):
-                changed.append(("小退间隔随机范围", f"{self.config.get('no_takeoff_logout_min', 0)}-{self.config.get('no_takeoff_logout_max', 0)} 分钟"))
+                changed.append(("小退间隔随机范围", f"{self.config.get('no_takeoff_logout_min', 20)}-{self.config.get('no_takeoff_logout_max', 30)} 分钟"))
             if (old_cfg.get("filter_switch_min") != self.config.get("filter_switch_min") or
                     old_cfg.get("filter_switch_max") != self.config.get("filter_switch_max")):
-                changed.append(("无任务切换间隔随机范围", f"{self.config.get('filter_switch_min', 3)}-{self.config.get('filter_switch_max', 6)} 秒"))
+                changed.append(("无任务切换间隔随机范围", f"{self.config.get('filter_switch_min', 5)}-{self.config.get('filter_switch_max', 10)} 秒"))
 
             anti_changed = (
                 old_cfg.get("slide_min") != self.config.get("slide_min") or
@@ -1606,9 +1606,9 @@ class Application(ttkb.Window):
             self.bot.set_thinking_time_mode(self.config.get("thinking_mode", 0), log_change=not no_log)
             self.bot.set_no_takeoff_mode(self.var_no_takeoff_mode.get())
             self.bot.set_no_takeoff_logout_interval(
-                self.config.get("no_takeoff_logout_min", 0), self.config.get("no_takeoff_logout_max", 0))
+                self.config.get("no_takeoff_logout_min", 20), self.config.get("no_takeoff_logout_max", 30))
             self.bot.set_filter_switch_interval(
-                self.config.get("filter_switch_min", 3), self.config.get("filter_switch_max", 6))
+                self.config.get("filter_switch_min", 5), self.config.get("filter_switch_max", 10))
             self.bot.set_cancel_stand_filter_when_tower_off(self.var_cancel_stand_filter.get())
             self.bot.set_control_method(self.config.get("control_method", "minitouch"))
             self.bot.set_screenshot_method(self.config.get("screenshot_method", "nemu_ipc"))

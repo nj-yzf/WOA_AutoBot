@@ -1361,6 +1361,8 @@ class WoaBot:
             self._tower_delay_deadline = 0.0
             self._tower_active_slots = [False, False, False, False]
             self.log("🗼 [塔台] 塔台图标全灰，判定塔台已关闭，不打开菜单")
+            if self.enable_no_takeoff_mode:
+                self.log("⚠️ [塔台] 不起飞模式已开启但塔台未开启，建议打开塔台控制器4以处理推出")
             return
         # 第三步：塔台非灰色，打开菜单读取时间
         self.log("🗼 [塔台] 塔台图标可见且非灰色，打开菜单读取控制器状态...")
@@ -1376,6 +1378,8 @@ class WoaBot:
             self._tower_delay_deadline = 0.0
             self._tower_active_slots = [False, False, False, False]
             self.log("🗼 [塔台] 四个控制器均未开启，塔台已关闭，以后不再打开菜单")
+            if self.enable_no_takeoff_mode:
+                self.log("⚠️ [塔台] 不起飞模式已开启但塔台未开启，建议打开塔台控制器4以获得最佳效果")
             self._close_tower_menu()
             return
         self._tower_active_slots = active
@@ -1555,11 +1559,20 @@ class WoaBot:
             times = self._read_tower_times(open_menu=False)
             valid_times = [t for t, a in zip(times, self._tower_active_slots) if a and t is not None and t > 0]
             if valid_times:
-                min_time = min(valid_times)
-                trigger_in = max(0, min_time - 180)
-                self._tower_delay_deadline = time.time() + trigger_in
-                mins, secs = divmod(int(min_time), 60)
-                self.log(f"🗼 [塔台] 最短剩余 {mins}m{secs}s，{int(trigger_in)}s 后执行下次延时")
+                if self.auto_delay_count > 0:
+                    # 还有延时次数，按延时模式：最短时间 - 3分钟
+                    min_time = min(valid_times)
+                    trigger_in = max(0, min_time - 180)
+                    self._tower_delay_deadline = time.time() + trigger_in
+                    mins, secs = divmod(int(min_time), 60)
+                    self.log(f"🗼 [塔台] 最短剩余 {mins}m{secs}s，{int(trigger_in)}s 后执行下次延时")
+                else:
+                    # 延时次数已用完，切换为监控模式：最长时间 + 10s
+                    max_time = max(valid_times)
+                    trigger_in = max_time + 10
+                    self._tower_delay_deadline = time.time() + trigger_in
+                    mins, secs = divmod(int(max_time), 60)
+                    self.log(f"🗼 [塔台] 延时次数已用完，切换为监控模式，最长剩余 {mins}m{secs}s，{int(trigger_in)}s 后确认塔台状态")
             else:
                 self._tower_delay_deadline = 0.0
                 self.log("🗼 [塔台] ⚠️ 延时后未能读取到有效时间")

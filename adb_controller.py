@@ -1350,7 +1350,7 @@ class AdbController:
         use_droidcast = (self.screenshot_method == "droidcast_raw" and force_method != "adb")
 
         def _log_screenshot_fallback(from_m, to_m, reason=""):
-            msg = f">>> [模式] 截图方案已切换: {from_m} -> {to_m}"
+            msg = f">>> [模式] ⚠️ 截图方案已切换: {from_m} -> {to_m}"
             if reason:
                 msg += f"（原因: {reason}）"
             print(msg)
@@ -1396,7 +1396,6 @@ class AdbController:
                     self._nemu_ipc._logged = "fail"
                     self.set_screenshot_method("adb", _is_fallback=True)
                     _log_screenshot_fallback("nemu_ipc", "adb", "nemu_ipc 仅支持 Windows")
-                    print(">>> [nemu_ipc] 仅支持 Windows，已回退到 ADB 截图")
             else:
                 img = self._get_screenshot_nemu_ipc()
                 if img is not None:
@@ -1517,7 +1516,7 @@ class AdbController:
                 print(f">>> [模式] 尝试恢复触控方案: {self._desired_control_method}")
 
         def _log_control_fallback(from_m, to_m, reason=""):
-            msg = f">>> [模式] 触控方案已切换: {from_m} -> {to_m}"
+            msg = f">>> [模式] ⚠️ 触控方案已切换: {from_m} -> {to_m}"
             if reason:
                 msg += f"（原因: {reason}）"
             print(msg)
@@ -1542,7 +1541,7 @@ class AdbController:
                     _woa_debug_log(f"click uiautomator2 异常: {e}")
                     if not self._u2_fallback_logged:
                         self._u2_fallback_logged = True
-                        print(">>> [uiautomator2] 触控失败，回退到 ADB")
+                        print("⚠️ [uiautomator2] 触控失败，回退到 ADB")
             _handle_control_degrade("uiautomator2", "uiautomator2 触控失败")
             self._adb_click_fallback(xi, yi)
             _woa_debug_log("click 已回退 adb_click_fallback")
@@ -1563,7 +1562,7 @@ class AdbController:
                 _woa_debug_log("click minitouch 发送失败")
                 if not getattr(self, '_minitouch_runtime_fallback_logged', False):
                     self._minitouch_runtime_fallback_logged = True
-                    print(">>> [minitouch] 触控发送失败，已回退到 ADB")
+                    print("⚠️ [minitouch] 触控发送失败，已回退到 ADB")
             _handle_control_degrade("minitouch", "minitouch 发送失败")
 
         _woa_debug_log(f"click 使用 adb shell input tap {xi} {yi}")

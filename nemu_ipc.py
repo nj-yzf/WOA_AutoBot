@@ -368,8 +368,8 @@ class NemuIpcHelper:
                 if folder is None or instance_id is None:
                     if self._logged != "fail":
                         self._logged = "fail"
-                        print(">>> [nemu_ipc] 启动失败，未找到 MuMu12 或端口非 16xxx，回退到 ADB 截图")
-                        print(">>> [nemu_ipc] 请尝试手动指定 MuMu 模拟器路径")
+                        print(">>> [nemu_ipc] ⚠️ 启动失败，未找到 MuMu12 或端口非 16xxx，回退到 ADB 截图")
+                        print(">>> [nemu_ipc] ⚠️ 请尝试手动指定 MuMu 模拟器路径")
                     return None
 
                 if not self._check_keep_alive(folder, instance_id):
