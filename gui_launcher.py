@@ -9,6 +9,7 @@ import traceback
 import tkinter as tk
 import ctypes
 import subprocess
+import msvcrt
 from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 from tkinter.constants import BOTH, END, LEFT, RIGHT, TOP, X, Y
@@ -51,12 +52,41 @@ def get_resource_path(relative_path):
     return p1
 
 
+
 _ICON_DIR = "icon"
 
+MAX_INSTANCES = 3
 
-CONFIG_FILE = "config.json"
+# === 多实例支持 ===
+def _acquire_instance():
+    """自动获取可用的实例槽位 (1~MAX_INSTANCES)，通过文件锁防止冲突。"""
+    for i in range(1, MAX_INSTANCES + 1):
+        lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"instance_{i}.lock")
+        try:
+            fh = open(lock_path, "w")
+            fh.write(str(i))
+            fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return i, fh
+        except (OSError, IOError):
+            try:
+                fh.close()
+            except Exception:
+                pass
+    return None, None
 
-LOCAL_VERSION = "v1.2.5"
+
+INSTANCE_ID, _INSTANCE_LOCK_FH = _acquire_instance()
+if INSTANCE_ID is None:
+    ctypes.windll.user32.MessageBoxW(0, f"已达到最大实例数 ({MAX_INSTANCES})，无法再开启新窗口。", "WOA AutoBot", 0x30)
+    sys.exit(1)
+
+# 按实例隔离配置和统计文件
+CONFIG_FILE = "config.json" if INSTANCE_ID == 1 else f"config_{INSTANCE_ID}.json"
+STATS_FILE = "woa_stats.csv" if INSTANCE_ID == 1 else f"woa_stats_{INSTANCE_ID}.csv"
+
+LOCAL_VERSION = "v1.2.6"
 _GITEE_RAW_URL = "https://gitee.com/shuang-nagi/WOA_AutoBot/raw/master/{}"
 _GITEE_API_URL = "https://gitee.com/api/v5/repos/shuang-nagi/WOA_AutoBot/contents/{}?ref=master"
 _GITEE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -227,6 +257,7 @@ class MultiTextRedirector(object):
         self.tag = tag
         self.log_buffer = collections.deque(maxlen=200)
         self.closing = False
+        self._queue = queue.Queue()
 
     def add_widget(self, widget):
         if widget not in self.widgets:
@@ -274,25 +305,36 @@ class MultiTextRedirector(object):
     def _insert_to_all(self, txt1, tag1, txt2=None, tag2=None):
         if self.closing:
             return
-        for w in self.widgets:
+        self._queue.put((txt1, tag1, txt2, tag2))
+
+    def _flush_queue(self):
+        """在主线程中调用，将队列中的日志写入 tkinter 控件"""
+        count = 0
+        while not self._queue.empty() and count < 50:
             try:
-                if not w.winfo_exists():
-                    continue
-                w.configure(state="normal")
-                w.insert("end", txt1, (tag1,))
-                if txt2:
-                    w.insert("end", txt2, (tag2,))
+                txt1, tag1, txt2, tag2 = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            for w in self.widgets:
                 try:
-                    if int(w.index('end-1c').split('.')[0]) > 1000:
-                        w.delete("1.0", "2.0")
+                    if not w.winfo_exists():
+                        continue
+                    w.configure(state="normal")
+                    w.insert("end", txt1, (tag1,))
+                    if txt2:
+                        w.insert("end", txt2, (tag2,))
+                    try:
+                        if int(w.index('end-1c').split('.')[0]) > 1000:
+                            w.delete("1.0", "2.0")
+                    except Exception:
+                        pass
+                    w.see("end")
+                    w.configure(state="disabled")
+                except (tk.TclError, RuntimeError):
+                    pass
                 except Exception:
                     pass
-                w.see("end")
-                w.configure(state="disabled")
-            except (tk.TclError, RuntimeError):
-                pass
-            except Exception:
-                pass
+            count += 1
 
     def flush(self):
         pass
@@ -333,7 +375,7 @@ class TeeToFile:
 class Application(ttkb.Window):
     def __init__(self):
         try:
-            myappid = 'woabot.launcher.v1.2.5'
+            myappid = 'woabot.launcher.v1.2.6'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except:
             pass
@@ -345,7 +387,7 @@ class Application(ttkb.Window):
         self.style.colors.primary = "#89b0ae"
         self.style.colors.info = "#9cbfdd"
 
-        self.title("WOA AutoBot v1.2.5")
+        self.title(f"WOA AutoBot v1.2.6" + (f" [实例 {INSTANCE_ID}]" if INSTANCE_ID > 1 else ""))
         self.geometry("680x850")
         self.last_geometry = "680x850"
         self.is_mini_mode = False
@@ -358,6 +400,7 @@ class Application(ttkb.Window):
         self.var_delay_bribe = tk.BooleanVar(value=self.config.get("delay_bribe", False))
         self.var_delay_count = tk.StringVar(value=str(self.config.get("auto_delay_count", 0)))
         self.var_random_task = tk.BooleanVar(value=self.config.get("random_task_order", True))
+        self.var_no_takeoff_mode = tk.BooleanVar(value=self.config.get("no_takeoff_mode", False))
         self.var_cancel_stand_filter = tk.BooleanVar(value=self.config.get("cancel_stand_filter", True))
         self.var_mini_top = tk.BooleanVar(value=False)
 
@@ -437,8 +480,35 @@ class Application(ttkb.Window):
                 pass
         self.bot = None
 
+        # 检查是否还有其他实例在运行
+        other_alive = False
+        for i in range(1, MAX_INSTANCES + 1):
+            if i == INSTANCE_ID:
+                continue
+            lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"instance_{i}.lock")
+            try:
+                fh = open(lock_path, "w")
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                fh.close()
+            except (OSError, IOError):
+                other_alive = True
+                break
+            except Exception:
+                pass
+
+        if not other_alive:
+            try:
+                close_all_and_kill_server()
+            except Exception:
+                pass
+        # 释放实例锁文件
         try:
-            close_all_and_kill_server()
+            if _INSTANCE_LOCK_FH:
+                _INSTANCE_LOCK_FH.close()
+                lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"instance_{INSTANCE_ID}.lock")
+                if os.path.exists(lock_path):
+                    os.remove(lock_path)
         except Exception:
             pass
         try:
@@ -606,11 +676,19 @@ class Application(ttkb.Window):
 
         f_row1 = ttkb.Frame(lf_func)
         f_row1.pack(fill=X)
-        add_switch(f_row1, "塔台关闭时取消停机位筛选", self.var_cancel_stand_filter,
-                   "开启后，塔台关闭时，脚本会强制取消停机位飞机的筛选，处理全部的待处理飞机。")
-
+        _row1_gap = 12
+        f_no_takeoff = ttkb.Frame(f_row1)
+        f_no_takeoff.pack(side=LEFT, padx=(0, _row1_gap), pady=8)
+        ttkb.Checkbutton(f_no_takeoff, text="不起飞模式", variable=self.var_no_takeoff_mode,
+                         bootstyle="success-round-toggle", command=self.sync_all_configs_to_bot).pack(side=LEFT)
+        self.create_info_icon(f_no_takeoff, "请配合塔台中Ground控制器使用，以完成推出操作。\n开启后，脚本会控制筛选状态在起飞和停机位两档间轮流切换：\n单档最多待15秒、无可用任务时切换、若仍无任务则来回切换以寻找任务。\n并且可以自动点击更改机场再重进以清空起飞飞机。\n此功能开启后，自动延时塔台将只会延时Ground控制器。").pack(side=LEFT, padx=5)
+        f_tower_off = ttkb.Frame(f_row1)
+        f_tower_off.pack(side=LEFT, padx=(0, _row1_gap), pady=8)
+        ttkb.Checkbutton(f_tower_off, text="塔台关闭筛选全部", variable=self.var_cancel_stand_filter,
+                         bootstyle="success-round-toggle", command=self.sync_all_configs_to_bot).pack(side=LEFT)
+        self.create_info_icon(f_tower_off, "开启后，塔台关闭时，脚本会强制取消停机位飞机的筛选，处理全部的待处理飞机。").pack(side=LEFT, padx=5)
         f_tower = ttkb.Frame(f_row1)
-        f_tower.pack(side=LEFT, padx=(15, 0), pady=8)
+        f_tower.pack(side=LEFT, padx=(_row1_gap-8, 0), pady=8)
         ttkb.Label(f_tower, text="自动延时塔台:").pack(side=LEFT)
         ttkb.Entry(f_tower, textvariable=self.var_delay_count, width=4).pack(side=LEFT, padx=3)
         ttkb.Label(f_tower, text="次").pack(side=LEFT)
@@ -790,7 +868,7 @@ class Application(ttkb.Window):
         win.protocol("WM_DELETE_WINDOW", _on_close)
         btn_frame = ttkb.Frame(win, padding=(15, 0, 15, 10))
         btn_frame.pack(fill=X)
-        ttkb.Button(btn_frame, text="我知道了", bootstyle="primary", command=_on_close).pack(side=RIGHT)
+        #ttkb.Button(btn_frame, text="我知道了", bootstyle="primary", command=_on_close).pack(side=RIGHT)
         self._center_toplevel_on_parent(win)
 
     _FIRST_RUN_OFFLINE_POPUP = """网络连接失败，如您的网络没有问题；
@@ -825,7 +903,7 @@ class Application(ttkb.Window):
         win.protocol("WM_DELETE_WINDOW", _on_close)
         btn_frame = ttkb.Frame(win, padding=(15, 0, 15, 10))
         btn_frame.pack(fill=X)
-        ttkb.Button(btn_frame, text="我知道了", bootstyle="primary", command=_on_close).pack(side=RIGHT)
+        #ttkb.Button(btn_frame, text="我知道了", bootstyle="primary", command=_on_close).pack(side=RIGHT)
         self._center_toplevel_on_parent(win)
 
     def _show_help_badge(self):
@@ -894,7 +972,7 @@ class Application(ttkb.Window):
         import csv
         from datetime import datetime, timedelta, date as date_type
 
-        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "woa_stats.csv")
+        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATS_FILE)
         if not os.path.isfile(csv_path):
             messagebox.showinfo("统计图表", "暂无统计数据，请先运行脚本。", parent=self)
             return
@@ -1133,7 +1211,7 @@ class Application(ttkb.Window):
         win = ttkb.Toplevel(self)
         self.settings_win = win
         win.title("高级设置")
-        win.geometry("540x880")
+        win.geometry("540x980")
         win.transient(self)
         win.grab_set()
         body = ttkb.Frame(win, padding=20)
@@ -1232,18 +1310,45 @@ class Application(ttkb.Window):
 
         ttkb.Separator(body).pack(fill=X, pady=15)
         ttkb.Label(body, text="速度优化（风险选项）", font=("bold")).pack(anchor="w")
-        f_filter = ttkb.Frame(body)
-        f_filter.pack(fill=X, pady=5)
-        ttkb.Checkbutton(f_filter, text="跳过二次校验", variable=self.var_speed_mode,
+        f_speed_row = ttkb.Frame(body)
+        f_speed_row.pack(fill=X, pady=5)
+        ttkb.Checkbutton(f_speed_row, text="跳过二次校验", variable=self.var_speed_mode,
                          bootstyle="success-round-toggle").pack(side=LEFT)
-        self.create_info_icon(f_filter,
+        self.create_info_icon(f_speed_row,
                               "跳过对于飞机类型的二次校验；\n风险较低，运行速度提升轻微。").pack(side=LEFT, padx=5)
-        f_skip = ttkb.Frame(body)
-        f_skip.pack(fill=X, pady=5)
-        ttkb.Checkbutton(f_skip, text="跳过地勤分配验证", variable=self.var_skip_staff,
-                         bootstyle="success-round-toggle").pack(side=LEFT)
-        self.create_info_icon(f_skip,
+        ttkb.Checkbutton(f_speed_row, text="跳过地勤分配验证", variable=self.var_skip_staff,
+                         bootstyle="success-round-toggle").pack(side=LEFT, padx=(15, 0))
+        self.create_info_icon(f_speed_row,
                               "地勤分配后不进行图标验证和颜色验证，直接开始；\n风险中等，可能导致飞机延误；\n仅推荐高峰期且有人在场时打开。").pack(side=LEFT, padx=5)
+
+        ttkb.Separator(body).pack(fill=X, pady=10)
+        ttkb.Label(body, text="不起飞模式", font=("bold")).pack(anchor="w")
+
+        f_switch = ttkb.Frame(body)
+        f_switch.pack(fill=X, pady=5)
+        ttkb.Label(f_switch, text="无任务切换间隔随机范围(s):").pack(side=LEFT)
+        e_switch_min = ttkb.Entry(f_switch, width=5)
+        e_switch_min.pack(side=LEFT, padx=5)
+        e_switch_min.insert(0, str(self.config.get("filter_switch_min", 3)))
+        ttkb.Label(f_switch, text="-").pack(side=LEFT)
+        e_switch_max = ttkb.Entry(f_switch, width=5)
+        e_switch_max.pack(side=LEFT, padx=5)
+        e_switch_max.insert(0, str(self.config.get("filter_switch_max", 6)))
+        self.create_info_icon(f_switch,
+                              "不起飞模式开启后，无可用任务时，在起飞和停机位两种筛选状态中，来回切换以寻找可用任务的随机时间间隔范围（秒）。\n默认 3-6 秒。").pack(side=LEFT, padx=5)
+
+        f_logout = ttkb.Frame(body)
+        f_logout.pack(fill=X, pady=5)
+        ttkb.Label(f_logout, text="小退间隔随机范围(分钟):").pack(side=LEFT)
+        e_logout_min = ttkb.Entry(f_logout, width=5)
+        e_logout_min.pack(side=LEFT, padx=5)
+        e_logout_min.insert(0, str(self.config.get("no_takeoff_logout_min", 0)))
+        ttkb.Label(f_logout, text="-").pack(side=LEFT)
+        e_logout_max = ttkb.Entry(f_logout, width=5)
+        e_logout_max.pack(side=LEFT, padx=5)
+        e_logout_max.insert(0, str(self.config.get("no_takeoff_logout_max", 0)))
+        self.create_info_icon(f_logout,
+                              "不起飞模式开启后，每隔该随机时长执行一次小退，清空起飞飞机\n（点击左上角菜单->更改机场->开始->等待返回主界面）。\n填 0-0 表示关闭自动小退。单位：分钟。").pack(side=LEFT, padx=5)
 
         ttkb.Separator(body).pack(fill=X, pady=10)
         ttkb.Label(body, text="防检测设置", font=("bold")).pack(anchor="w")
@@ -1320,8 +1425,30 @@ class Application(ttkb.Window):
             self.config["thinking_mode"] = c_th.current()
             self.config["speed_mode"] = self.var_speed_mode.get()
             self.config["skip_staff"] = self.var_skip_staff.get()
+            self.config["no_takeoff_mode"] = self.var_no_takeoff_mode.get()
             self.config["cancel_stand_filter"] = self.var_cancel_stand_filter.get()
             self.config["random_task_order"] = self.var_random_task.get()
+            try:
+                lo_min = float(e_logout_min.get().strip())
+                lo_max = float(e_logout_max.get().strip())
+                lo_min = max(0, lo_min)
+                lo_max = max(0, lo_max)
+                if lo_max < lo_min: lo_max = lo_min
+            except (ValueError, AttributeError):
+                lo_min, lo_max = 0, 0
+            self.config["no_takeoff_logout_min"] = lo_min
+            self.config["no_takeoff_logout_max"] = lo_max
+            try:
+                sw_min = float(e_switch_min.get())
+                sw_max = float(e_switch_max.get())
+                if sw_min < 0.5: sw_min = 0.5
+                if sw_max > 60: sw_max = 60
+                if sw_max < sw_min: sw_max = sw_min
+                self.config["filter_switch_min"] = sw_min
+                self.config["filter_switch_max"] = sw_max
+            except (ValueError, AttributeError):
+                self.config["filter_switch_min"] = 3
+                self.config["filter_switch_max"] = 6
 
             changed = []
             if old_cfg.get("adb_path") != self.config.get("adb_path"):
@@ -1338,14 +1465,24 @@ class Application(ttkb.Window):
                 changed.append(("跳过二次校验", "开" if self.config.get("speed_mode") else "关"))
             if old_cfg.get("skip_staff") != self.config.get("skip_staff"):
                 changed.append(("跳过地勤分配验证", "开" if self.config.get("skip_staff") else "关"))
+            if old_cfg.get("no_takeoff_mode") != self.config.get("no_takeoff_mode"):
+                changed.append(("不起飞模式", "开" if self.config.get("no_takeoff_mode") else "关"))
             if old_cfg.get("cancel_stand_filter") != self.config.get("cancel_stand_filter"):
-                changed.append(("塔台关闭取消停机位筛选", "开" if self.config.get("cancel_stand_filter") else "关"))
+                changed.append(("塔台关闭筛选全部飞机", "开" if self.config.get("cancel_stand_filter") else "关"))
+            if (old_cfg.get("no_takeoff_logout_min") != self.config.get("no_takeoff_logout_min") or
+                    old_cfg.get("no_takeoff_logout_max") != self.config.get("no_takeoff_logout_max")):
+                changed.append(("小退间隔随机范围", f"{self.config.get('no_takeoff_logout_min', 0)}-{self.config.get('no_takeoff_logout_max', 0)} 分钟"))
+            if (old_cfg.get("filter_switch_min") != self.config.get("filter_switch_min") or
+                    old_cfg.get("filter_switch_max") != self.config.get("filter_switch_max")):
+                changed.append(("无任务切换间隔随机范围", f"{self.config.get('filter_switch_min', 3)}-{self.config.get('filter_switch_max', 6)} 秒"))
 
             anti_changed = (
                 old_cfg.get("slide_min") != self.config.get("slide_min") or
                 old_cfg.get("slide_max") != self.config.get("slide_max") or
                 old_cfg.get("thinking_mode") != self.config.get("thinking_mode") or
-                old_cfg.get("random_task_order") != self.config.get("random_task_order")
+                old_cfg.get("random_task_order") != self.config.get("random_task_order") or
+                old_cfg.get("filter_switch_min") != self.config.get("filter_switch_min") or
+                old_cfg.get("filter_switch_max") != self.config.get("filter_switch_max")
             )
 
             for name, val in changed:
@@ -1415,7 +1552,8 @@ class Application(ttkb.Window):
             btn.configure(state="normal")
         self.combo_devices.configure(state="disabled")
         from main_adb import WoaBot
-        self.bot = WoaBot(log_callback=self.log_to_queue, config_callback=self.on_bot_config_update)
+        self.bot = WoaBot(log_callback=self.log_to_queue, config_callback=self.on_bot_config_update,
+                          instance_id=INSTANCE_ID)
         self.bot.set_device(device)
         self.sync_all_configs_to_bot()
         self.bot.start()
@@ -1451,7 +1589,7 @@ class Application(ttkb.Window):
             elif cnt > 144:
                 cnt = 144
         except ValueError:
-            cnt = 0
+            cnt = self.config.get("auto_delay_count", 0)
         self.var_delay_count.set(str(cnt))
         self.config["auto_delay_count"] = cnt
         self.save_config()
@@ -1466,6 +1604,11 @@ class Application(ttkb.Window):
             self.bot.set_slide_duration_range(
                 self.config.get("slide_min", 250), self.config.get("slide_max", 500), log_change=not no_log)
             self.bot.set_thinking_time_mode(self.config.get("thinking_mode", 0), log_change=not no_log)
+            self.bot.set_no_takeoff_mode(self.var_no_takeoff_mode.get())
+            self.bot.set_no_takeoff_logout_interval(
+                self.config.get("no_takeoff_logout_min", 0), self.config.get("no_takeoff_logout_max", 0))
+            self.bot.set_filter_switch_interval(
+                self.config.get("filter_switch_min", 3), self.config.get("filter_switch_max", 6))
             self.bot.set_cancel_stand_filter_when_tower_off(self.var_cancel_stand_filter.get())
             self.bot.set_control_method(self.config.get("control_method", "minitouch"))
             self.bot.set_screenshot_method(self.config.get("screenshot_method", "nemu_ipc"))
@@ -1484,12 +1627,7 @@ class Application(ttkb.Window):
         self.log_queue.put(msg)
 
     def process_log_queue(self):
-        # 【新增】UI防卡死保护：每次只处理最多50条日志
-        # 即使后台疯狂报错，UI也不会因为要插入几千条日志而未响应
-        count = 0
-        while not self.log_queue.empty() and count < 50:
-            self.log_queue.get()
-            count += 1
+        self.redirector._flush_queue()
         self.after(self.queue_check_interval, self.process_log_queue)
 
 

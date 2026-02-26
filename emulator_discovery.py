@@ -18,6 +18,100 @@ else:
     codecs = None
 
 
+def get_mumu_install_from_registry() -> List[str]:
+    """
+    从 Windows 注册表读取 MuMu 模拟器的安装路径
+    查找 Uninstall 注册表中 MuMu/Nemu 相关条目的 InstallLocation
+    Returns: 去重后的安装目录列表
+    """
+    if not winreg:
+        return []
+    dirs = []
+    reg_paths = [
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+    ]
+    mumu_keys = [
+        "Nemu", "Nemu9", "MuMuPlayer", "MuMuPlayer-12.0",
+        "MuMu Player 12.0", "MuMu Player 12", "MuMu Player 6",
+    ]
+    for reg_path in reg_paths:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path) as reg:
+                i = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(reg, i)
+                        i += 1
+                    except OSError:
+                        break
+                    if sub not in mumu_keys:
+                        continue
+                    try:
+                        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{reg_path}\\{sub}") as sk:
+                            inst_dir, _ = winreg.QueryValueEx(sk, "InstallLocation")
+                    except Exception:
+                        continue
+                    if inst_dir and os.path.isdir(inst_dir.rstrip("\\/")):
+                        inst_dir = inst_dir.rstrip("\\/")
+                        if inst_dir not in dirs:
+                            dirs.append(inst_dir)
+                        # 同时添加父目录（如 C:\Program Files\Netease）
+                        parent = os.path.dirname(inst_dir)
+                        if parent and os.path.isdir(parent) and parent not in dirs:
+                            dirs.append(parent)
+        except Exception:
+            pass
+    # 额外尝试 MuMu 专属注册表路径
+    for key_path in [r"SOFTWARE\Netease\MuMu", r"SOFTWARE\Netease\MuMuPlayer"]:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as sk:
+                inst_dir, _ = winreg.QueryValueEx(sk, "InstallDir")
+                if inst_dir and os.path.isdir(inst_dir.rstrip("\\/")):
+                    inst_dir = inst_dir.rstrip("\\/")
+                    if inst_dir not in dirs:
+                        dirs.append(inst_dir)
+                    parent = os.path.dirname(inst_dir)
+                    if parent and os.path.isdir(parent) and parent not in dirs:
+                        dirs.append(parent)
+        except Exception:
+            pass
+    return dirs
+
+
+def _get_mumu_base_dirs() -> List[str]:
+    """
+    获取所有可能的 MuMu 模拟器基础目录（去重）
+    优先级：注册表 > Program Files > 各盘符扫描
+    """
+    bases = []
+    seen = set()
+
+    def _add(p):
+        if p and os.path.isdir(p):
+            np = os.path.normpath(p)
+            if np not in seen:
+                seen.add(np)
+                bases.append(np)
+
+    # 1. 注册表发现（最可靠）
+    for d in get_mumu_install_from_registry():
+        _add(d)
+
+    # 2. 标准 Program Files 路径
+    for env_key in ["ProgramFiles", "ProgramFiles(x86)"]:
+        pf = os.environ.get(env_key, "")
+        if pf:
+            _add(os.path.join(pf, "Netease"))
+
+    # 3. 各盘符扫描 Program Files\Netease
+    for drive in ["C", "D", "E", "F", "G", "H", "I", "J"]:
+        _add(rf"{drive}:\Program Files\Netease")
+        _add(rf"{drive}:\Program Files (x86)\Netease")
+
+    return bases
+
+
 def _iter_folder(folder, is_dir=False, ext=None):
     """安全遍历目录"""
     try:
@@ -71,11 +165,7 @@ def get_mumu_serials_from_vms() -> List[Tuple[str, str, str]]:
     Returns: [(serial, name, emu_dir), ...]
     """
     result = []
-    bases = [
-        r"E:\APP\MuMuPlayer",
-        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Netease"),
-    ]
+    bases = _get_mumu_base_dirs()
     for base in bases:
         if not base or not os.path.isdir(base):
             continue
@@ -121,36 +211,30 @@ def get_mumu_serials_from_vms() -> List[Tuple[str, str, str]]:
 
 def get_mumu_adb_paths() -> List[str]:
     """获取 MuMu 自带的 adb 路径"""
-    candidates = [
-        r"E:\APP\MuMuPlayer\nx_main\adb.exe",
-        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease", "MuMu Player 12", "nx_main", "adb.exe"),
-        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease", "MuMu", "nx_main", "adb.exe"),
-        os.path.join("D:", "Program Files", "Netease", "MuMu", "nx_main", "adb.exe"),
-        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease", "MuMu Player 6", "MuMu", "adb.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Netease", "MuMu Player 12", "nx_main", "adb.exe"),
-    ]
     found = []
-    for p in candidates:
-        if p and os.path.isfile(p):
-            found.append(os.path.normpath(p))
-    for drive in ["C", "D", "E", "F"]:
-        for base in [rf"{drive}:\Program Files\Netease", rf"{drive}:\APP\MuMuPlayer", rf"{drive}:\Program Files (x86)\Netease"]:
-            if not os.path.isdir(base):
-                continue
-            try:
-                for name in os.listdir(base):
-                    if "MuMu" not in name:
-                        continue
-                    for sub in ["nx_main", "MuMu", "emulator\\nemu"]:
-                        p = os.path.join(base, name, sub, "adb.exe")
-                        if os.path.isfile(p):
-                            found.append(os.path.normpath(p))
-                    # MuMu9 vmonitor
-                    vmon = os.path.join(base, name, "emulator", "nemu9", "vmonitor", "bin", "adb_server.exe")
-                    if os.path.isfile(vmon):
-                        found.append(os.path.normpath(vmon))
-            except Exception:
-                pass
+    for base in _get_mumu_base_dirs():
+        if not os.path.isdir(base):
+            continue
+        # base 本身可能就是 MuMu 安装目录（如 C:\Program Files\Netease\MuMu Player 12）
+        for sub in ["nx_main", "MuMu", "emulator\\nemu"]:
+            p = os.path.join(base, sub, "adb.exe")
+            if os.path.isfile(p):
+                found.append(os.path.normpath(p))
+        # 遍历 base 下的子目录（如 Netease 下的 MuMu Player 12 等）
+        try:
+            for name in os.listdir(base):
+                if "MuMu" not in name:
+                    continue
+                for sub in ["nx_main", "MuMu", "emulator\\nemu"]:
+                    p = os.path.join(base, name, sub, "adb.exe")
+                    if os.path.isfile(p):
+                        found.append(os.path.normpath(p))
+                # MuMu9 vmonitor
+                vmon = os.path.join(base, name, "emulator", "nemu9", "vmonitor", "bin", "adb_server.exe")
+                if os.path.isfile(vmon):
+                    found.append(os.path.normpath(vmon))
+        except Exception:
+            pass
     return list(dict.fromkeys(found))
 
 
@@ -190,17 +274,7 @@ def get_mumu_nemu_folders_for_serial(serial: str) -> List[Tuple[str, int]]:
     index = serial_to_nemu_id(serial)
     if index is None:
         return []
-    bases = [
-        r"E:\APP\MuMuPlayer",
-        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Netease"),
-    ]
-    for drive in ["C", "D", "E", "F"]:
-        bases.extend([
-            rf"{drive}:\Program Files\Netease",
-            rf"{drive}:\APP\MuMuPlayer",
-            rf"{drive}:\Program Files (x86)\Netease",
-        ])
+    bases = _get_mumu_base_dirs()
     result = []
     seen_base = set()
     seen_folder = set()

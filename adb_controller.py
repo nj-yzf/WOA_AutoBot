@@ -12,229 +12,16 @@ import re
 import random
 import threading
 
+from woa_debug import (
+    _woa_debug_enabled, woa_debug_set_runtime_started, _woa_debug_log,
+    get_woa_debug_dir, read_image_safe, save_image_safe,
+    _woa_debug_save_img, _woa_debug_save_screenshot,
+    _woa_debug_save_click_before, woa_debug_save_roi,
+)
+from nemu_ipc import NemuIpcHelper, _load_dll_safe, NEMU_IPC_DEBUG
+
 # 用于进程退出时清理残留（含非正常关闭）
 _adb_instances = []
-
-# 写死为 0，长期关闭 nemu_ipc_debug 文件夹内截图保存；改为 1 可重新开启
-NEMU_IPC_DEBUG = 0
-
-
-class _SafeDLLWrapper:
-    """包装 DLL 句柄，手动通过 GetProcAddress 获取函数地址，绕过 Nuitka 的 ctypes 拦截逻辑"""
-    def __init__(self, handle, path):
-        self._handle = handle
-        self._path = path
-        self._funcs = {}
-        
-        # 必须显式定义 GetProcAddress 的签名，否则 64位 下默认返回 c_int 会导致地址截断/溢出
-        self._get_proc_addr = ctypes.windll.kernel32.GetProcAddress
-        self._get_proc_addr.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        self._get_proc_addr.restype = ctypes.c_void_p
-
-    def __getattr__(self, name):
-        if name in self._funcs:
-            return self._funcs[name]
-        
-        # 尝试多种可能的函数名变体
-        # 1. 原名 (nemu_connect)
-        # 2. 驼峰名 (NemuConnect)
-        # 3. MuMu 12 驼峰带 Ipc (NemuIpcConnect)
-        # 4. 其它各种变体 (W后缀, Renderer前缀, connect, _下划线等)
-        camel_name = "".join(x.capitalize() for x in name.split("_"))
-        parts = name.split("_")
-        
-        variants = [
-            name.encode('ascii'),                             # nemu_connect
-            f"{name}W".encode('ascii'),                        # nemu_connectW
-            camel_name.encode('ascii'),                        # NemuConnect
-            f"{camel_name}W".encode('ascii'),                  # NemuConnectW
-            name.replace("nemu_", "nemu_ipc_").encode('ascii'),# nemu_ipc_connect
-            # NemuIpcConnect
-            (parts[0].capitalize() + "Ipc" + "".join(p.capitalize() for p in parts[1:])).encode('ascii'),
-            name.replace("nemu_", "mumu_").encode('ascii'),   # mumu_connect
-            name.replace("nemu_", "mumu_ipc_").encode('ascii'),# mumu_ipc_connect
-            ("Renderer" + "".join(p.capitalize() for p in parts[1:])).encode('ascii'), # RendererConnect
-            name.replace("nemu_", "").encode('ascii'),        # connect
-            f"_{name}".encode('ascii'),                        # _nemu_connect
-            f"_{name}@8".encode('ascii')                       # _nemu_connect@8
-        ]
-        
-        addr = None
-        for v in variants:
-            addr = self._get_proc_addr(self._handle, v)
-            if addr: break
-            
-        if not addr:
-            raise AttributeError(f"function '{name}' (variants: {variants}) not found in {self._path}")
-
-        # 为了支持设置 argtypes/restype，我们需要直接返回函数指针包装
-        class FuncWrapper:
-            def __init__(self, addr, name):
-                self._addr = addr
-                self._name = name
-                self.argtypes = None
-                self.restype = ctypes.c_int
-            def __call__(self, *args):
-                # 动态创建调用函数，默认为 cdecl (CDLL)，与 ALAS 一致
-                # 64位下 CDLL/WinDLL 差异不大，但 32位下必须区分
-                # 由于无法确定 DLL 是 cdecl 还是 stdcall，优先尝试 CDLL
-                types = self.argtypes if self.argtypes is not None else []
-                try:
-                    f = ctypes.CFUNCTYPE(self.restype, *types)(self._addr)
-                    return f(*args)
-                except ValueError:
-                    # 如果堆栈不平衡（32位 stdcall），可能报错，尝试 WinDLL
-                    f = ctypes.WINFUNCTYPE(self.restype, *types)(self._addr)
-                    return f(*args)
-        
-        wrapped = FuncWrapper(addr, name)
-        self._funcs[name] = wrapped
-        return wrapped
-
-def _load_dll_safe(dll_path):
-    """从可能包含中文的路径加载 DLL，兼容 ctypes 在非 ASCII 路径下的问题"""
-    dll_path = os.path.abspath(dll_path)
-    if not os.path.exists(dll_path):
-        return None
-    
-    handle = None
-    
-    # 策略1：直接尝试 ctypes.CDLL (PyInstaller/源码运行首选，ALAS 也是用 CDLL)
-    try:
-        # 注意：Python 3.8+ Windows 下加载 DLL 需要处理依赖路径
-        dll_dir = os.path.dirname(dll_path)
-        if hasattr(os, 'add_dll_directory'):
-            try:
-                os.add_dll_directory(dll_dir)
-            except Exception:
-                pass
-        
-        lib = ctypes.CDLL(dll_path)
-        handle = lib._handle
-    except Exception:
-        pass
-        
-    # 策略2：Nuitka 兼容模式 / 手动 LoadLibraryExW
-    if not handle:
-        try:
-            # 必须显式定义 LoadLibraryExW 的签名，否则 64位 下返回 c_int 会截断句柄
-            load_lib = ctypes.windll.kernel32.LoadLibraryExW
-            load_lib.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
-            load_lib.restype = ctypes.c_void_p
-            
-            # 使用 LoadLibraryExW 显式加载句柄，并支持同目录下依赖加载
-            # LOAD_WITH_ALTERED_SEARCH_PATH = 0x8
-            handle = load_lib(dll_path, None, 0x00000008)
-        except Exception:
-            pass
-            
-    # 策略3：回退到 chdir + CDLL (老式兼容)
-    if not handle:
-        dll_dir = os.path.dirname(dll_path)
-        dll_name = os.path.basename(dll_path)
-        old_cwd = os.getcwd()
-        try:
-            os.chdir(dll_dir)
-            lib = ctypes.CDLL(dll_name)
-            handle = lib._handle
-        except Exception:
-            pass
-        finally:
-            try:
-                os.chdir(old_cwd)
-            except OSError:
-                pass
-
-    if handle:
-        # 始终返回包装类，以利用其多变体函数名查找功能
-        return _SafeDLLWrapper(handle, dll_path)
-        
-    return None
-
-# 调试开关：WOA_DEBUG=1 时仅在启动阶段输出连接/方案测试的详细日志，运行中不再刷屏
-def _woa_debug_enabled():
-    return os.environ.get("WOA_DEBUG", "").strip().lower() in ("1", "true", "yes")
-
-_woa_debug_runtime_started = False  # 主循环开始后为 True，此后不再输出运行时调试日志、不保存截/ROI
-
-def woa_debug_set_runtime_started():
-    global _woa_debug_runtime_started
-    _woa_debug_runtime_started = True
-
-def _woa_debug_log(msg):
-    if not _woa_debug_enabled():
-        return
-    if _woa_debug_runtime_started:
-        return  # 运行中不输出，仅启动阶段（连接、方案测试）输出
-    print(f">>> [WOA_DEBUG] {msg}")
-
-def get_woa_debug_dir():
-    """返回 woa_debug 目录路径（兼容开发与打包）"""
-    if getattr(sys, 'frozen', False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "woa_debug")
-
-def read_image_safe(path):
-    """支持中文路径的图片读取方式"""
-    import cv2
-    import numpy as np
-    if not os.path.exists(path):
-        return None
-    try:
-        img_array = np.fromfile(path, dtype=np.uint8)
-        return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-    except Exception:
-        return None
-
-def save_image_safe(path, img):
-    """支持中文路径的图片保存方式"""
-    if img is None:
-        return False
-    try:
-        import cv2
-        is_success, buffer = cv2.imencode(".png", img)
-        if is_success:
-            with open(path, "wb") as f:
-                f.write(buffer)
-            return True
-    except Exception:
-        pass
-    return False
-
-def _woa_debug_save_img(img, subdir, prefix):
-    """仅在方案测试阶段保存图片，运行中不再保存"""
-    if not _woa_debug_enabled() or img is None or _woa_debug_runtime_started:
-        return
-    try:
-        base = os.path.join(get_woa_debug_dir(), subdir)
-        os.makedirs(base, exist_ok=True)
-        path = os.path.join(base, f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.png")
-        if save_image_safe(path, img):
-            print(f">>> [WOA_DEBUG] 已保存: {path}")  # 方案测试阶段直接 print，不走 _woa_debug_log
-    except Exception:
-        pass
-
-def _woa_debug_save_screenshot(img, method):
-    """运行中不再保存截图，仅在方案测试时由 run_all_method_tests 保存"""
-    if _woa_debug_runtime_started:
-        return
-    # 以下逻辑仅在启动阶段有效，方案测试会直接调用 _woa_debug_save_img
-    if not _woa_debug_enabled() or img is None:
-        return
-    # 保留计数避免重复，但实际不再保存（run_all_method_tests 自己保存 method_test）
-    pass
-
-def _woa_debug_save_click_before(img, x, y, method):
-    """运行中不再保存点击前截图"""
-    if _woa_debug_runtime_started or not _woa_debug_enabled() or img is None:
-        return
-    pass
-
-def woa_debug_save_roi(img, roi_name):
-    """调试精简：不再保存 ROI 区域图"""
-    return
 
 
 def kill_adb_server():
@@ -390,7 +177,10 @@ class AdbController:
     """支持多种触控方案（参考 AzurLaneAutoScript）: adb, minitouch, uiautomator2"""
     VALID_CONTROL_METHODS = ("adb", "minitouch", "uiautomator2")
 
-    def __init__(self, target_device=None, use_minitouch=False, screenshot_method="adb", control_method=None):
+    def __init__(self, target_device=None, use_minitouch=False, screenshot_method="adb", control_method=None, instance_id=1):
+        self.instance_id = instance_id
+        self._minitouch_base_port = 17392 + (instance_id - 1)
+        self._droidcast_base_port = 53516 + (instance_id - 1)
         self.device_serial = target_device
         self.adb_path = CURRENT_ADB_PATH or "adb"
         if control_method is not None:
@@ -408,6 +198,7 @@ class AdbController:
         self._control_consec_fails = 0
         self._last_screenshot_recovery_time = 0.0
         self._last_control_recovery_time = 0.0
+        self._adb_screenshot_consec_total_fails = 0
         self.think_min = 0.0
         self.think_max = 0.0
         _adb_instances.append(self)
@@ -430,13 +221,7 @@ class AdbController:
         self._minitouch_screen_h = 900
 
         # nemu_ipc 截图（MuMu12 专用）
-        self._nemu_ipc_lib = None
-        self._nemu_ipc_connect_id = 0
-        self._nemu_ipc_folder = None
-        self._nemu_ipc_instance_id = None
-        self._nemu_ipc_logged = None  # "ok"/"fail" 用于避免重复日志
-        self._nemu_ipc_pixel_format = None  # auto 检测后缓存的 "rgba" 或 "bgra"
-        self._nemu_ipc_executor = None  # 复用的 ThreadPoolExecutor
+        self._nemu_ipc = NemuIpcHelper(self)
         self.mumu_path = ""  # 手动指定的 MuMu 安装路径，留空则自动检测
         self._nemu_folder_callback = None  # 自动识别成功时回调 (folder) -> None
 
@@ -516,7 +301,7 @@ class AdbController:
         return self._u2_init_impl(for_control=False)
 
     def _u2_init_impl(self, for_control=True, allow_screenshot_fallback=False):
-        """初始化 u2 设备：for_control=True 时需 control_method==u2；for_control=False 时需 screenshot_method==u2 或 allow_screenshot_fallback"""
+        """初始化 u2 设备：参考 ALAS，模拟器使用 connect_usb，连接失败时自动安装 atx-agent"""
         if self._u2_device is not None:
             return True
         if self._closed or not self.device_serial:
@@ -526,20 +311,78 @@ class AdbController:
         if not for_control and self.screenshot_method != "uiautomator2" and not allow_screenshot_fallback:
             return False
         try:
+            # lxml 是 u2 的依赖但本项目不使用 XML 解析功能，Nuitka 打包可能漏掉
+            try:
+                import lxml  # noqa: F401
+            except ImportError:
+                import types
+                _mock_lxml = types.ModuleType("lxml")
+                _mock_etree = types.ModuleType("lxml.etree")
+                _mock_lxml.etree = _mock_etree
+                import sys
+                sys.modules["lxml"] = _mock_lxml
+                sys.modules["lxml.etree"] = _mock_etree
             import uiautomator2 as u2  # type: ignore[import-untyped]
-            self._u2_ensure_assets(u2)  # 含补丁：core.with_package_resource 优先从 assets/ 查找
-            self._u2_device = u2.connect(self.device_serial)
-            msg = "触控将使用 atx-agent" if for_control else "截图将使用 atx-agent"
-            print(f">>> [uiautomator2] 已启用，{msg}")
-            return True
-        except ImportError:
+            self._u2_ensure_assets(u2)
+            # 参考 ALAS：模拟器使用 connect_usb（走 ADB 通道），物理设备使用 connect
+            serial = self.device_serial
+            is_emulator = serial.startswith("127.0.0.1:") or serial.startswith("emulator-")
+            for attempt in range(2):
+                try:
+                    if is_emulator:
+                        self._u2_device = u2.connect_usb(serial)
+                    else:
+                        self._u2_device = u2.connect(serial)
+                    # 保持长连接（参考 ALAS：7天超时）
+                    if hasattr(self._u2_device, 'set_new_command_timeout'):
+                        self._u2_device.set_new_command_timeout(604800)
+                    msg = "触控将使用 atx-agent" if for_control else "截图将使用 atx-agent"
+                    print(f">>> [uiautomator2] 已启用，{msg}")
+                    return True
+                except Exception as e:
+                    if attempt == 0:
+                        # 首次失败：尝试自动安装 atx-agent（参考 ALAS install_uiautomator2）
+                        try:
+                            print(f">>> [uiautomator2] 连接失败({e})，尝试自动安装 atx-agent...")
+                            import logging
+                            init = u2.init.Initer(self._get_adb_client_for_u2(), loglevel=logging.WARNING)
+                            # MuMu X 可能没有 ro.product.cpu.abi，从 abilist 取（参考 ALAS）
+                            if hasattr(init, 'abi') and hasattr(init, 'abis'):
+                                if init.abi not in ['x86_64', 'x86', 'arm64-v8a', 'armeabi-v7a', 'armeabi']:
+                                    if init.abis:
+                                        init.abi = init.abis[0]
+                            if hasattr(init, 'set_atx_agent_addr'):
+                                init.set_atx_agent_addr('127.0.0.1:7912')
+                            try:
+                                init.install()
+                            except ConnectionError:
+                                # GitHub 下载失败，尝试国内镜像
+                                if hasattr(u2.init, 'GITHUB_BASEURL'):
+                                    u2.init.GITHUB_BASEURL = 'http://tool.appetizer.io/openatx'
+                                    init.install()
+                            print(">>> [uiautomator2] atx-agent 安装完成，重试连接...")
+                        except Exception as install_err:
+                            print(f">>> [uiautomator2] atx-agent 安装失败: {install_err}")
+                            break
+                    else:
+                        # 第二次仍然失败
+                        flag = self._u2_fallback_logged if for_control else self._u2_screenshot_fallback_logged
+                        if not flag:
+                            if for_control:
+                                self._u2_fallback_logged = True
+                            else:
+                                self._u2_screenshot_fallback_logged = True
+                            print(f">>> [uiautomator2] 连接失败: {e}，回退到 ADB")
+            return False
+        except ImportError as e:
             flag = self._u2_fallback_logged if for_control else self._u2_screenshot_fallback_logged
             if not flag:
                 if for_control:
                     self._u2_fallback_logged = True
                 else:
                     self._u2_screenshot_fallback_logged = True
-                print(">>> [uiautomator2] 未安装，请运行: pip install uiautomator2 ，回退到 ADB")
+                # 打印具体缺少的模块名
+                print(f">>> [uiautomator2] 未安装({e})，回退到 ADB")
             return False
         except Exception as e:
             flag = self._u2_fallback_logged if for_control else self._u2_screenshot_fallback_logged
@@ -548,8 +391,18 @@ class AdbController:
                     self._u2_fallback_logged = True
                 else:
                     self._u2_screenshot_fallback_logged = True
-                print(f">>> [uiautomator2] 连接失败: {e}，回退到 ADB")
+                print(f">>> [uiautomator2] 初始化异常: {e}，回退到 ADB")
             return False
+
+    def _get_adb_client_for_u2(self):
+        """获取 adbutils 的 AdbDevice 对象，供 u2.init.Initer 使用"""
+        try:
+            import adbutils
+            adb_client = adbutils.AdbClient(host="127.0.0.1", port=5037)
+            return adb_client.device(self.device_serial)
+        except Exception:
+            # 回退：直接传 serial 字符串，部分 u2 版本支持
+            return self.device_serial
 
     def _do_think(self):
         if self.think_max > 0:
@@ -563,6 +416,13 @@ class AdbController:
         """启动持久化 ADB Shell 会话"""
         if not self.device_serial or self._closed:
             return
+
+        # 防止频繁重建：冷却 3 秒
+        now = time.time()
+        last = getattr(self, '_last_shell_start_time', 0)
+        if now - last < 3.0:
+            return
+        self._last_shell_start_time = now
 
         try:
             with self.shell_lock:
@@ -655,7 +515,7 @@ class AdbController:
             return False
         self.run_cmd(["shell", "chmod", "755", "/data/local/tmp/minitouch"], timeout=tout)
         is_net = "127.0.0.1" not in (self.device_serial or "")
-        port = 17392
+        port = self._minitouch_base_port
 
         # 参考 ALAS：用持久子进程保持 minitouch 存活，避免 shell 退出后进程被收走
         self.run_cmd(["shell", "pkill", "-f", "minitouch"], timeout=tout)
@@ -739,7 +599,7 @@ class AdbController:
         try:
             with self._minitouch_lock:
                 self._minitouch_client = client
-                self._minitouch_port = 17392
+                self._minitouch_port = self._minitouch_base_port
                 self._minitouch_ready = True
             _o = self._minitouch_orientation
             _ominfo = f", orientation={_o}" if _o else ""
@@ -837,7 +697,7 @@ class AdbController:
                     pass
             self._minitouch_proc = None
         try:
-            self.run_cmd(["forward", "--remove", "tcp:17392"], timeout=1)
+            self.run_cmd(["forward", "--remove", f"tcp:{self._minitouch_base_port}"], timeout=1)
         except Exception:
             pass
         self._u2_device = None
@@ -854,22 +714,14 @@ class AdbController:
         self._droidcast_session = None
         self._droidcast_port = 0
         try:
-            self.run_cmd(["forward", "--remove", "tcp:53516"], timeout=1)
+            self.run_cmd(["forward", "--remove", f"tcp:{self._droidcast_base_port}"], timeout=1)
         except Exception:
             pass
-        if self._nemu_ipc_connect_id and self._nemu_ipc_lib:
+        if self._nemu_ipc:
             try:
-                self._nemu_ipc_lib.nemu_disconnect(self._nemu_ipc_connect_id)
+                self._nemu_ipc.close()
             except Exception:
                 pass
-            self._nemu_ipc_connect_id = 0
-        if self._nemu_ipc_executor:
-            try:
-                self._nemu_ipc_executor.shutdown(wait=False)
-            except Exception:
-                pass
-            self._nemu_ipc_executor = None
-        self._nemu_ipc_pixel_format = None
         acquired = self.shell_lock.acquire(timeout=1.0)
         try:
             if not self.shell_process:
@@ -912,9 +764,12 @@ class AdbController:
                     self.shell_process.stdin.flush()
                     return True
                 except (BrokenPipeError, OSError):
-                    # 管道断裂，尝试重启一次
+                    # 管道断裂，尝试底层 ADB 重连后再重启 shell
                     print("⚠️ [底层] Shell 管道断裂，尝试重连...")
-                    time.sleep(0.5)  # 给 ADB 一点缓冲时间
+                    self.shell_process = None
+                    time.sleep(0.5)
+                    self.connect()
+                    time.sleep(0.3)
                     self._start_persistent_shell()
                     try:
                         if self.shell_process and self.shell_process.stdin:
@@ -962,7 +817,6 @@ class AdbController:
                 if p and os.path.isfile(p):
                     return p
         candidates = [
-            r"E:\APP\MuMuPlayer\nx_main\adb.exe",
             os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease", "MuMu Player 12", "nx_main", "adb.exe"),
             os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease", "MuMu", "nx_main", "adb.exe"),
             os.path.join("D:", "Program Files", "Netease", "MuMu", "nx_main", "adb.exe"),
@@ -973,7 +827,7 @@ class AdbController:
             if p and os.path.isfile(p):
                 return p
         for drive in ["C", "D", "E", "F"]:
-            for base in [rf"{drive}:\Program Files\Netease", rf"{drive}:\APP", rf"{drive}:\Program Files (x86)\Netease"]:
+            for base in [rf"{drive}:\Program Files\Netease", rf"{drive}:\Program Files (x86)\Netease"]:
                 if not os.path.isdir(base):
                     continue
                 try:
@@ -995,7 +849,8 @@ class AdbController:
             if ports:
                 return ports[:12]
         ports = []
-        for base in [r"E:\APP\MuMuPlayer", os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease")]:
+        for base in [os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Netease"),
+                      os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Netease")]:
             vms_dir = os.path.join(base, "vms") if os.path.isdir(base) else None
             if not vms_dir or not os.path.isdir(vms_dir):
                 continue
@@ -1090,19 +945,26 @@ class AdbController:
                     print(f">>> [扫描调试] adb devices 异常: {e}")
                 return []
 
-        try:
-            subprocess.run([scan_adb, "kill-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=3, creationflags=creationflags)
-        except Exception:
-            pass
-        time.sleep(0.25)
-        try:
-            subprocess.run([scan_adb, "start-server"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=5, creationflags=creationflags)
-        except Exception as e:
-            if debug:
-                print(f">>> [扫描调试] start-server 异常: {e}")
-        time.sleep(0.2)
+        # 先尝试不重启 server 直接获取已连接设备
+        pre_devices = _devices_list()
+        if debug:
+            print(f">>> [扫描调试] 预扫描已连接设备: {pre_devices if pre_devices else '(无)'}")
+
+        # 仅在没有任何已连接设备时才重启 server
+        if not pre_devices:
+            try:
+                subprocess.run([scan_adb, "kill-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=3, creationflags=creationflags)
+            except Exception:
+                pass
+            time.sleep(0.25)
+            try:
+                subprocess.run([scan_adb, "start-server"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=5, creationflags=creationflags)
+            except Exception as e:
+                if debug:
+                    print(f">>> [扫描调试] start-server 异常: {e}")
+            time.sleep(0.2)
 
         # MuMuManager 连接已存在的 MuMu 实例（仅连接 vms 中实际存在的，避免自动创建新设备）
         mumu_adb = AdbController._find_mumu_adb()
@@ -1180,10 +1042,27 @@ class AdbController:
         _woa_debug_log(f"connect 设备={getattr(self, 'device_serial', None)}")
         if self.device_serial and ":" in self.device_serial:
             # 针对网络设备的重连逻辑
-            self.run_cmd(["disconnect", self.device_serial])
-            time.sleep(0.2)
-            self.run_cmd(["connect", self.device_serial])
+            self.run_cmd(["disconnect", self.device_serial], timeout=5)
+            time.sleep(0.3)
+            r = self.run_cmd(["connect", self.device_serial], timeout=8)
+            ok = False
+            if r and r.stdout:
+                out = r.stdout.decode('utf-8', errors='ignore')
+                ok = "connected" in out.lower()
+            if not ok:
+                # 第一次失败，等待后重试
+                time.sleep(1.0)
+                r = self.run_cmd(["connect", self.device_serial], timeout=8)
+                if r and r.stdout:
+                    out = r.stdout.decode('utf-8', errors='ignore')
+                    ok = "connected" in out.lower()
+            if ok:
+                _woa_debug_log("connect 成功")
+            else:
+                print(f"⚠️ [底层] ADB connect 未确认成功: {self.device_serial}")
             _woa_debug_log("connect 已执行 disconnect+connect")
+            return ok
+        return True
 
     def run_all_method_tests(self):
         """调试模式：在启动前测试所有截图方案和触控方案"""
@@ -1237,380 +1116,9 @@ class AdbController:
         self.use_minitouch = (bak_ctrl == "minitouch")
         print(">>> [WOA_DEBUG] ========== 方案测试结束 ==========")
 
-    def _nemu_ipc_find_folder_and_id(self):
-        """从 serial 解析 MuMu12 安装路径和实例 ID（参考 ALAS NemuIpcImpl.serial_to_id）"""
-        if not self.device_serial or ":" not in self.device_serial:
-            return None, None
-        try:
-            port = int(self.device_serial.split(":")[1])
-        except (ValueError, IndexError):
-            return None, None
-        index, offset = divmod(port - 16384 + 16, 32)
-        offset -= 16
-        # ALAS may_mumu12_family: 16384 <= port <= 17408
-        if not (0 <= index < 33 and offset in (-2, -1, 0, 1, 2)):
-            return None, None
-
-        # 优先使用手动指定的 MuMu 安装路径
-        if self.mumu_path and os.path.isdir(self.mumu_path):
-            folder = os.path.abspath(self.mumu_path)
-            if "MuMuPlayerGlobal" in folder:
-                return None, None
-            for rel in ("shell/sdk/external_renderer_ipc.dll", "nx_device/12.0/shell/sdk/external_renderer_ipc.dll"):
-                fp = os.path.join(folder, rel)
-                if os.path.isfile(fp):
-                    try:
-                        if self._nemu_folder_callback:
-                            self._nemu_folder_callback(folder)
-                    except Exception:
-                        pass
-                    return folder, index
-
-        try:
-            from emulator_discovery import get_mumu_serials_from_vms
-        except ImportError:
-            return None, None
-        for serial, name, emu_dir in get_mumu_serials_from_vms():
-            if serial != self.device_serial:
-                continue
-            if not emu_dir or not os.path.isdir(emu_dir):
-                continue
-            cand_folders = [emu_dir]
-            if "MuMuPlayerGlobal" in emu_dir:
-                print(f"❌ [nemu_ipc] MuMuPlayerGlobal 不支持 nemu_ipc 截图")
-                return None, None
-            for sub in ("MuMu Player 12", "MuMuPlayer-12.0", "MuMuPlayer12", "MuMu"):
-                p = os.path.join(emu_dir, sub)
-                if os.path.isdir(p):
-                    cand_folders.append(p)
-            for folder in cand_folders:
-                for rel in ("shell/sdk/external_renderer_ipc.dll", "nx_device/12.0/shell/sdk/external_renderer_ipc.dll"):
-                    fp = os.path.join(folder, rel)
-                    if os.path.isfile(fp):
-                        try:
-                            if self._nemu_folder_callback:
-                                self._nemu_folder_callback(os.path.abspath(folder))
-                        except Exception:
-                            pass
-                        return folder, index
-        # 回退2：从当前 ADB 路径推断 MuMu 根目录（部分安装如 C:\Program Files\Netease\MuMu 未被 vms 枚举）
-        adb_path = self.adb_path if self.adb_path and os.path.isfile(self.adb_path) else None
-        if adb_path and "nx_main" in adb_path.replace("\\", "/") and "Netease" in adb_path:
-            mumu_root = os.path.dirname(os.path.dirname(os.path.abspath(adb_path)))
-            if "MuMuPlayerGlobal" in mumu_root:
-                return None, None
-            if os.path.isdir(mumu_root):
-                for rel in ("shell/sdk/external_renderer_ipc.dll", "nx_device/12.0/shell/sdk/external_renderer_ipc.dll"):
-                    fp = os.path.join(mumu_root, rel)
-                    if os.path.isfile(fp):
-                        try:
-                            if self._nemu_folder_callback:
-                                self._nemu_folder_callback(os.path.abspath(mumu_root))
-                        except Exception:
-                            pass
-                        return mumu_root, index
-        # 回退3：扫描 Netease 等目录查找含 DLL 的 MuMu 根目录（参考 ALAS emulator 发现）
-        try:
-            from emulator_discovery import get_mumu_nemu_folders_for_serial
-        except ImportError:
-            pass
-        else:
-            for folder, idx in get_mumu_nemu_folders_for_serial(self.device_serial):
-                if folder and os.path.isdir(folder) and idx == index:
-                    try:
-                        if self._nemu_folder_callback:
-                            self._nemu_folder_callback(os.path.abspath(folder))
-                    except Exception:
-                        pass
-                    return folder, idx
-        return None, None
-
-    def _nemu_ipc_capture_stderr(self, func, *args):
-        """捕获 DLL 输出的 stderr（参考 ALAS CaptureNemuIpc）"""
-        stderr_b = b''
-        r = w = None
-        try:
-            fd_err = sys.stderr.fileno()
-        except (ValueError, OSError):
-            return stderr_b
-        try:
-            r, w = os.pipe()
-            old_stderr = os.dup(fd_err)
-            os.dup2(w, fd_err)
-            sys.stderr.flush()
-            try:
-                func(*args)
-            finally:
-                os.dup2(old_stderr, fd_err)
-                os.close(old_stderr)
-                if w is not None:
-                    os.close(w)
-                    w = None
-            chunks = []
-            while r is not None:
-                try:
-                    chunk = os.read(r, 4096)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                except (OSError, BlockingIOError):
-                    break
-            stderr_b = b''.join(chunks)
-        except Exception:
-            pass
-        if r is not None:
-            try:
-                os.close(r)
-            except OSError:
-                pass
-        if w is not None:
-            try:
-                os.close(w)
-            except OSError:
-                pass
-        return stderr_b
-
-    def _nemu_ipc_auto_detect_format(self, arr, height, width):
-        """通过与 ADB 截图比对，自动确定 RGBA 或 BGRA"""
-        import cv2
-        import numpy as np
-        do_flip = os.environ.get("NEMU_IPC_FLIP", "1") != "0"
-        img_rgba = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-        img_bgra = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-        if do_flip:
-            img_rgba = cv2.flip(img_rgba, 0)
-            img_bgra = cv2.flip(img_bgra, 0)
-        adb_img = self.get_screenshot(force_method="adb")
-        if adb_img is None or adb_img.size == 0:
-            self._nemu_ipc_pixel_format = "rgba"
-            return "rgba"
-        if adb_img.shape[:2] != (height, width):
-            adb_img = cv2.resize(adb_img, (width, height), interpolation=cv2.INTER_LINEAR)
-        mse_rgba = np.mean((img_rgba.astype(np.float32) - adb_img.astype(np.float32)) ** 2)
-        mse_bgra = np.mean((img_bgra.astype(np.float32) - adb_img.astype(np.float32)) ** 2)
-        chosen = "rgba" if mse_rgba <= mse_bgra else "bgra"
-        self._nemu_ipc_pixel_format = chosen
-        print(f">>> [nemu_ipc] 已自动检测像素格式: {chosen} (MSE rgba={mse_rgba:.0f} bgra={mse_bgra:.0f})")
-        return chosen
-
-    def _nemu_ipc_debug_save(self, img_bgr, arr_raw, width, height, pixel_fmt, do_flip):
-        """调试：保存 nemu_ipc 截图及对比用 ADB 截图，便于排查格式/方向问题"""
-        import cv2
-        import datetime
-        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nemu_ipc_debug")
-        try:
-            os.makedirs(debug_dir, exist_ok=True)
-        except OSError:
-            return
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        cnt = getattr(self, "_nemu_ipc_debug_count", 0)
-        if cnt >= 5:
-            return
-        self._nemu_ipc_debug_count = cnt + 1
-        try:
-            p_nemu = os.path.join(debug_dir, f"nemu_{ts}_fmt{pixel_fmt}_flip{int(do_flip)}.png")
-            save_image_safe(p_nemu, img_bgr)
-            bgr_mean = img_bgr.mean(axis=(0, 1))
-            print(f">>> [nemu_ipc DEBUG] 已保存: {p_nemu}  shape={img_bgr.shape} BGR_mean={bgr_mean.round(1).tolist()}")
-            adb_img = self.get_screenshot(force_method="adb")
-            if adb_img is not None and adb_img.size > 0:
-                p_adb = os.path.join(debug_dir, f"adb_{ts}.png")
-                save_image_safe(p_adb, adb_img)
-                adb_mean = adb_img.mean(axis=(0, 1))
-                print(f">>> [nemu_ipc DEBUG] 已保存: {p_adb}  BGR_mean={adb_mean.round(1).tolist()}")
-        except Exception as e:
-            print(f">>> [nemu_ipc DEBUG] 保存失败: {e}")
-
-    def _nemu_ipc_check_keep_alive(self, mumu_root, instance_id):
-        """检查 MuMu12 是否开启了'后台挂机时保活运行'，该选项会导致 nemu_ipc 无法截图。
-        路径参考: vms/MuMuPlayer-12.0-{index}/configs/customer_config.json
-        """
-        try:
-            import json
-            # MuMu12 的 vms 目录通常在安装根目录下
-            vms_dir = os.path.join(mumu_root, "vms")
-            if not os.path.isdir(vms_dir):
-                return True # 找不到目录则跳过检查
-            
-            # 查找匹配的实例目录，通常格式为 MuMuPlayer-12.0-0, MuMuPlayer-12.0-1 等
-            # 但也有可能直接是 MuMuPlayer-12.0
-            target_name = f"MuMuPlayer-12.0-{instance_id}"
-            config_file = os.path.join(vms_dir, target_name, "configs", "customer_config.json")
-            
-            if not os.path.isfile(config_file):
-                # 尝试另一种可能的路径 (部分版本可能没有 -{id} 或者路径略有不同)
-                alt_configs = [
-                    os.path.join(vms_dir, "MuMuPlayer-12.0", "configs", "customer_config.json"),
-                    os.path.join(vms_dir, f"MuMuPlayer-12.0-instance{instance_id}", "configs", "customer_config.json")
-                ]
-                for alt in alt_configs:
-                    if os.path.isfile(alt):
-                        config_file = alt
-                        break
-            
-            if os.path.isfile(config_file):
-                with open(config_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # ALAS key: customer.app_keptlive
-                    keptlive = data.get("customer", {}).get("app_keptlive", False)
-                    if keptlive is True or str(keptlive).lower() == "true":
-                        print("❌ [nemu_ipc] 检测到模拟器开启了'后台挂机时保活运行'，这会导致截图失败。")
-                        print(">>> 请在 MuMu 模拟器设置 -> 运行设置 中关闭该选项后重试。")
-                        return False
-        except Exception:
-            pass # 检查失败不影响主流程
-        return True
-
     def _get_screenshot_nemu_ipc(self):
-        """MuMu12 nemu_ipc 截图（参考 ALAS nemu_ipc.py）"""
-        import cv2
-        import numpy as np
-        import concurrent.futures
-        try:
-            if self._nemu_ipc_lib is None:
-                folder, instance_id = self._nemu_ipc_find_folder_and_id()
-                if folder is None or instance_id is None:
-                    if self._nemu_ipc_logged != "fail":
-                        self._nemu_ipc_logged = "fail"
-                        print(">>> [nemu_ipc] 未找到 MuMu12 或端口非 16xxx，回退到 ADB 截图")
-                    return None
-                
-                # 兼容性检查：后台保活
-                if not self._nemu_ipc_check_keep_alive(folder, instance_id):
-                    self._nemu_ipc_logged = "fail"
-                    return None
-
-                for rel in ("shell/sdk/external_renderer_ipc.dll", "nx_device/12.0/shell/sdk/external_renderer_ipc.dll"):
-                    dll_path = os.path.join(folder, rel)
-                    if os.path.isfile(dll_path):
-                        self._nemu_ipc_lib = _load_dll_safe(dll_path)
-                        self._nemu_ipc_lib.nemu_connect.argtypes = [ctypes.c_wchar_p, ctypes.c_int]
-                        self._nemu_ipc_lib.nemu_connect.restype = ctypes.c_int
-                        
-                        # 添加 nemu_capture_display 的签名定义
-                        self._nemu_ipc_lib.nemu_capture_display.argtypes = [
-                            ctypes.c_int, ctypes.c_int, ctypes.c_int, 
-                            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), 
-                            ctypes.c_void_p
-                        ]
-                        self._nemu_ipc_lib.nemu_capture_display.restype = ctypes.c_int
-                        
-                        self._nemu_ipc_folder = folder
-                        self._nemu_ipc_nx_device = "nx_device" in rel
-                        self._nemu_ipc_instance_id = instance_id
-                        print(f">>> [nemu_ipc] 已加载 DLL，folder={folder!r}，instance_id={instance_id}")
-                        break
-                if self._nemu_ipc_lib is None:
-                    if self._nemu_ipc_logged != "fail":
-                        self._nemu_ipc_logged = "fail"
-                        print(">>> [nemu_ipc] 未找到 external_renderer_ipc.dll，回退到 ADB 截图")
-                    return None
-            if self._nemu_ipc_connect_id == 0:
-                folders_to_try = [os.path.abspath(self._nemu_ipc_folder)]
-                if getattr(self, "_nemu_ipc_nx_device", False):
-                    alt = os.path.join(self._nemu_ipc_folder, "nx_device", "12.0")
-                    if os.path.isdir(alt):
-                        folders_to_try.append(os.path.abspath(alt))
-                connect_id = 0
-                last_stderr = b""
-                for folder_path in folders_to_try:
-                    connect_id = self._nemu_ipc_lib.nemu_connect(folder_path, self._nemu_ipc_instance_id)
-                    if connect_id > 0:
-                        break
-                    last_stderr = self._nemu_ipc_capture_stderr(
-                        lambda f=folder_path: self._nemu_ipc_lib.nemu_connect(f, self._nemu_ipc_instance_id)
-                    )
-                if connect_id == 0:
-                    err_msg = last_stderr.decode("utf-8", errors="replace").strip() if last_stderr else ""
-                    hint = ""
-                    if last_stderr:
-                        sb = last_stderr
-                        if b"error: 1783" in sb or b"error: 1745" in sb:
-                            hint = " MuMu12 版本需 >= 3.8.13，请升级模拟器。"
-                        elif b"error: 1722" in sb or b"error: 1726" in sb:
-                            hint = " 模拟器进程可能已退出，请重启 MuMu。"
-                        elif b"cannot find rpc connection" in sb:
-                            hint = " 无法找到 RPC 连接，请确认模拟器已启动且保持前台。"
-                    if self._nemu_ipc_logged != "fail":
-                        self._nemu_ipc_logged = "fail"
-                        reason = ">>> [nemu_ipc] nemu_connect 失败，回退到 ADB 截图。"
-                        reason += hint or " MuMu 5.x 可能与 nemu_ipc 不兼容。"
-                        if err_msg:
-                            reason += f" stderr: {err_msg[:200]}"
-                        print(reason)
-                    return None
-                self._nemu_ipc_connect_id = connect_id
-                if self._nemu_ipc_logged != "ok":
-                    self._nemu_ipc_logged = "ok"
-                    print(">>> [nemu_ipc] 已启用，仅 MuMu 可用，速度极快")
-            if self._nemu_ipc_executor is None:
-                self._nemu_ipc_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            executor = self._nemu_ipc_executor
-            # 1. 获取分辨率
-            w_ptr = ctypes.pointer(ctypes.c_int(0))
-            h_ptr = ctypes.pointer(ctypes.c_int(0))
-            future = executor.submit(
-                self._nemu_ipc_lib.nemu_capture_display,
-                self._nemu_ipc_connect_id, 0, 0, w_ptr, h_ptr, None
-            )
-            try:
-                ret = future.result(timeout=0.5)
-            except concurrent.futures.TimeoutError:
-                future.cancel()
-                _woa_debug_log("nemu_ipc get_resolution timeout")
-                return None
-            
-            if ret > 0:
-                self._nemu_ipc_connect_id = 0
-                return None
-            width, height = w_ptr.contents.value, h_ptr.contents.value
-            if width <= 0 or height <= 0 or width > 7680 or height > 4320:
-                self._nemu_ipc_connect_id = 0
-                return None
-
-            length = width * height * 4
-            buf = (ctypes.c_ubyte * length)()
-            future = executor.submit(
-                self._nemu_ipc_lib.nemu_capture_display,
-                self._nemu_ipc_connect_id, 0, length, w_ptr, h_ptr, ctypes.byref(buf)
-            )
-            try:
-                ret = future.result(timeout=1.0)
-            except concurrent.futures.TimeoutError:
-                future.cancel()
-                _woa_debug_log("nemu_ipc screenshot timeout")
-                self._nemu_ipc_connect_id = 0
-                return None
-
-            if ret > 0:
-                self._nemu_ipc_connect_id = 0
-                return None
-            arr = np.ctypeslib.as_array(buf).reshape((height, width, 4)).copy()
-            # 像素格式：auto=与 ADB 比对自动检测，rgba/bgra=手动指定
-            fmt_env = os.environ.get("NEMU_IPC_PIXEL_FORMAT", "auto").lower()
-            if fmt_env in ("rgba", "bgra"):
-                pixel_fmt = fmt_env
-            elif fmt_env == "auto" and self._nemu_ipc_pixel_format is not None:
-                pixel_fmt = self._nemu_ipc_pixel_format
-            elif fmt_env == "auto":
-                pixel_fmt = self._nemu_ipc_auto_detect_format(arr, height, width)
-            else:
-                pixel_fmt = "rgba"
-            if pixel_fmt == "bgra":
-                img = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-            else:
-                img = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-            do_flip = os.environ.get("NEMU_IPC_FLIP", "1") != "0"
-            if do_flip:
-                img = cv2.flip(img, 0)
-            if NEMU_IPC_DEBUG:
-                self._nemu_ipc_debug_save(img, arr, width, height, pixel_fmt, do_flip)
-            return img
-        except Exception as e:
-            if self._nemu_ipc_logged != "fail":
-                self._nemu_ipc_logged = "fail"
-                print(f">>> [nemu_ipc] 异常: {e}，回退到 ADB 截图")
-            return None
+        """MuMu12 nemu_ipc 截图（委托给 NemuIpcHelper）"""
+        return self._nemu_ipc.get_screenshot()
 
     def _get_droidcast_raw_apk_path(self):
         """获取 DroidCast_raw.apk 路径（参考 ALAS，需从 Torther/DroidCastS 下载）"""
@@ -1659,8 +1167,8 @@ class AdbController:
                     print(f">>> [DroidCast_raw] 启动失败: {e}，回退到 ADB")
                 return False
             time.sleep(2.0)
-            self.run_cmd(["forward", "--remove", "tcp:53516"], timeout=5)
-            if not self._adb_forward("tcp:53516", "tcp:53516"):
+            self.run_cmd(["forward", "--remove", f"tcp:{self._droidcast_base_port}"], timeout=5)
+            if not self._adb_forward(f"tcp:{self._droidcast_base_port}", f"tcp:{self._droidcast_base_port}"):
                 if getattr(self, "_droidcast_proc", None):
                     try:
                         self._droidcast_proc.terminate()
@@ -1671,7 +1179,7 @@ class AdbController:
                     self._droidcast_fallback_logged = True
                     print(">>> [DroidCast_raw] 端口转发失败，回退到 ADB")
                 return False
-            self._droidcast_port = 53516
+            self._droidcast_port = self._droidcast_base_port
             self._droidcast_session = True  # 使用 urlopen 无需 session 对象
             print(">>> [DroidCast_raw] 已启用")
             return True
@@ -1691,7 +1199,7 @@ class AdbController:
             self.run_cmd(["shell", "pkill", "-9", "-f", "DroidCast"], timeout=5)
         except Exception:
             pass
-        self.run_cmd(["forward", "--remove", "tcp:53516"], timeout=3)
+        self.run_cmd(["forward", "--remove", f"tcp:{self._droidcast_base_port}"], timeout=3)
 
     def _get_screenshot_droidcast_raw(self):
         """DroidCast 截图（PNG模式）：使用 /preview 接口避免 RGB565 格式问题，请求 1600x900"""
@@ -1705,7 +1213,7 @@ class AdbController:
         try:
             from urllib.request import urlopen
             # DroidCast_raw 也支持 /preview 接口返回 PNG
-            url = f"http://127.0.0.1:53516/preview?width={w_req}&height={h_req}"
+            url = f"http://127.0.0.1:{self._droidcast_base_port}/preview?width={w_req}&height={h_req}"
             resp = urlopen(url, timeout=5)
             image = resp.read()
         except Exception:
@@ -1740,7 +1248,8 @@ class AdbController:
             return None
 
     def _get_screenshot_u2(self, as_fallback=False):
-        """uiautomator2 截图（atx-agent）。as_fallback=True 时允许在非 u2 配置下尝试（用于 nemu_ipc 等回退链）"""
+        """uiautomator2 截图（atx-agent）。as_fallback=True 时允许在非 u2 配置下尝试（用于 nemu_ipc 等回退链）
+        参考 ALAS：失败时重试，JSONDecodeError 时重装 atx-agent"""
         import cv2
         import numpy as np
         if as_fallback:
@@ -1749,23 +1258,68 @@ class AdbController:
             ok = self._u2_init_screenshot()
         if not ok or not self._u2_device:
             return None
+        for attempt in range(2):
+            try:
+                pil_img = self._u2_device.screenshot()
+                if pil_img is None:
+                    raise RuntimeError("screenshot returned None")
+                arr = np.asarray(pil_img)
+                if arr.ndim != 3 or arr.size == 0:
+                    raise RuntimeError("invalid screenshot array")
+                if arr.shape[2] == 3:
+                    img = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                elif arr.shape[2] == 4:
+                    img = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+                else:
+                    return None
+                return img
+            except Exception as e:
+                if attempt == 0:
+                    # 首次失败：重置 u2 连接，尝试重连
+                    err_name = type(e).__name__
+                    _woa_debug_log(f"u2 screenshot 失败({err_name}: {e})，尝试重连...")
+                    self._u2_device = None
+                    # JSONDecodeError 通常意味着 atx-agent 崩溃，需要重装
+                    try:
+                        from json import JSONDecodeError
+                        if isinstance(e, JSONDecodeError):
+                            print(f">>> [uiautomator2] atx-agent 异常，尝试重装...")
+                            self._u2_reinstall_atx_agent()
+                    except ImportError:
+                        pass
+                    # 重新初始化连接
+                    if as_fallback:
+                        self._u2_init_impl(for_control=False, allow_screenshot_fallback=True)
+                    else:
+                        self._u2_init_screenshot()
+                    if not self._u2_device:
+                        return None
+                else:
+                    return None
+        return None
+
+    def _u2_reinstall_atx_agent(self):
+        """重装 atx-agent（参考 ALAS install_uiautomator2）"""
         try:
-            # d.screenshot() 返回 PIL.Image；部分版本支持 format='opencv' 直接返回 BGR
-            pil_img = self._u2_device.screenshot()
-            if pil_img is None:
-                return None
-            arr = np.asarray(pil_img)
-            if arr.ndim != 3 or arr.size == 0:
-                return None
-            if arr.shape[2] == 3:
-                img = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            elif arr.shape[2] == 4:
-                img = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-            else:
-                return None
-            return img
-        except Exception:
-            return None
+            import uiautomator2 as u2
+            import logging
+            adb_dev = self._get_adb_client_for_u2()
+            init = u2.init.Initer(adb_dev, loglevel=logging.WARNING)
+            if hasattr(init, 'abi') and hasattr(init, 'abis'):
+                if init.abi not in ['x86_64', 'x86', 'arm64-v8a', 'armeabi-v7a', 'armeabi']:
+                    if init.abis:
+                        init.abi = init.abis[0]
+            if hasattr(init, 'set_atx_agent_addr'):
+                init.set_atx_agent_addr('127.0.0.1:7912')
+            try:
+                init.install()
+            except ConnectionError:
+                if hasattr(u2.init, 'GITHUB_BASEURL'):
+                    u2.init.GITHUB_BASEURL = 'http://tool.appetizer.io/openatx'
+                    init.install()
+            print(">>> [uiautomator2] atx-agent 重装完成")
+        except Exception as e:
+            print(f">>> [uiautomator2] atx-agent 重装失败: {e}")
 
     _SCREENSHOT_MAX_CONSEC_FAILS = 3
     _SCREENSHOT_RECOVERY_INTERVAL = 120
@@ -1838,8 +1392,8 @@ class AdbController:
 
         if use_nemu:
             if sys.platform != "win32":
-                if self._nemu_ipc_logged != "fail":
-                    self._nemu_ipc_logged = "fail"
+                if self._nemu_ipc._logged != "fail":
+                    self._nemu_ipc._logged = "fail"
                     self.set_screenshot_method("adb", _is_fallback=True)
                     _log_screenshot_fallback("nemu_ipc", "adb", "nemu_ipc 仅支持 Windows")
                     print(">>> [nemu_ipc] 仅支持 Windows，已回退到 ADB 截图")
@@ -1904,11 +1458,13 @@ class AdbController:
 
         img = _try_exec_out()
         if img is not None:
+            self._adb_screenshot_consec_total_fails = 0
             _woa_debug_log("get_screenshot 成功 adb(exec-out)")
             _woa_debug_save_screenshot(img, "adb_exec")
             return img
         img = _try_pull()
         if img is not None:
+            self._adb_screenshot_consec_total_fails = 0
             _woa_debug_log("get_screenshot 成功 adb(pull)")
             _woa_debug_save_screenshot(img, "adb_pull")
             return img
@@ -1916,10 +1472,20 @@ class AdbController:
         time.sleep(0.2)
         img = _try_exec_out() or _try_pull()
         if img is not None:
+            self._adb_screenshot_consec_total_fails = 0
             _woa_debug_log("get_screenshot 成功 adb(重试)")
             _woa_debug_save_screenshot(img, "adb_retry")
         else:
-            _woa_debug_log("get_screenshot 全部失败 返回 None")
+            # 连续全部失败时尝试 ADB 重连
+            if not hasattr(self, '_adb_screenshot_consec_total_fails'):
+                self._adb_screenshot_consec_total_fails = 0
+            self._adb_screenshot_consec_total_fails += 1
+            _woa_debug_log(f"get_screenshot 全部失败 (连续{self._adb_screenshot_consec_total_fails}次)")
+            if self._adb_screenshot_consec_total_fails >= 3:
+                print(f"⚠️ [底层] 截图连续{self._adb_screenshot_consec_total_fails}次全部失败，尝试 ADB 重连...")
+                self._adb_screenshot_consec_total_fails = 0
+                self.connect()
+                self._start_persistent_shell()
         return img
 
     def get_pixel_color(self, x, y):
@@ -1947,6 +1513,7 @@ class AdbController:
                 self.use_minitouch = (self._desired_control_method == "minitouch")
                 self._control_consec_fails = 0
                 self._minitouch_ready = False
+                self._minitouch_runtime_fallback_logged = False
                 print(f">>> [模式] 尝试恢复触控方案: {self._desired_control_method}")
 
         def _log_control_fallback(from_m, to_m, reason=""):

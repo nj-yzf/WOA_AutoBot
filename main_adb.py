@@ -8,6 +8,7 @@ import os
 import gc
 import traceback
 from adb_controller import AdbController, woa_debug_set_runtime_started, save_image_safe, read_image_safe
+from simple_ocr import StopSignal, SimpleOCR
 
 
 def get_resource_path(relative_path):
@@ -21,135 +22,13 @@ def get_resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-class StopSignal(Exception):
-    pass
-
-
-class SimpleOCR:
-    def __init__(self, adb_controller, icon_path):
-        self.adb = adb_controller
-        self.root_path = os.path.join(icon_path, "digits")
-        self.SCALE_FACTOR = 4
-        self.templates_global = {}
-        self.templates_task = {}
-        self._load_templates("global", self.templates_global)
-        self._load_templates("task", self.templates_task)
-
-    def _process_image(self, img):
-        if img is None or img.size == 0: return None
-        h, w = img.shape[:2]
-        try:
-            scaled_img = cv2.resize(img, (w * self.SCALE_FACTOR, h * self.SCALE_FACTOR), interpolation=cv2.INTER_LINEAR)
-            if len(scaled_img.shape) == 3:
-                gray = cv2.cvtColor(scaled_img, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = scaled_img
-            _, binary = cv2.threshold(gray, 170, 255, cv2.THRESH_BINARY)
-            return binary
-        except Exception:
-            return None
-
-    def _load_templates(self, sub_folder, target_dict):
-        folder_path = os.path.join(self.root_path, sub_folder) + os.sep
-        if not os.path.exists(folder_path): return
-        chars = [str(i) for i in range(10)] + ['slash']
-        for char in chars:
-            path = folder_path + char + ".png"
-            if os.path.exists(path):
-                img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-                target_dict[char] = img
-
-    def recognize_number(self, region, mode='global', screen_image=None):
-        x, y, w, h = region
-        if screen_image is not None:
-            full_screen = screen_image
-        else:
-            full_screen = self.adb.get_screenshot()
-        if full_screen is None: return None
-
-        if y < 0 or x < 0 or y + h > full_screen.shape[0] or x + w > full_screen.shape[1]:
-            return None
-
-        crop_img = full_screen[y:y + h, x:x + w]
-        processed_crop = self._process_image(crop_img)
-        if processed_crop is None: return None
-
-        templates = self.templates_global if mode == 'global' else self.templates_task
-        if not templates: return None
-        matches = []
-        threshold = 0.7
-        for char, template in templates.items():
-            if template.shape[0] > processed_crop.shape[0] or template.shape[1] > processed_crop.shape[1]:
-                continue
-            res = cv2.matchTemplate(processed_crop, template, cv2.TM_CCOEFF_NORMED)
-            loc = np.where(res >= threshold)
-            t_w = template.shape[1]
-            for pt in zip(*loc[::-1]):
-                score = res[pt[1], pt[0]]
-                matches.append({'x': pt[0], 'char': '/' if char == 'slash' else char, 'score': score, 'width': t_w})
-        if not matches: return None
-        matches.sort(key=lambda k: k['x'])
-        final_results = []
-        while len(matches) > 0:
-            curr = matches.pop(0)
-            keep_curr = True
-            if final_results:
-                last = final_results[-1]
-                is_one_slash = (curr['char'] == '1' and last['char'] == '/') or \
-                               (curr['char'] == '/' and last['char'] == '1')
-                if is_one_slash:
-                    final_results.append(curr)
-                    continue
-                start = max(last['x'], curr['x'])
-                end = min(last['x'] + last['width'], curr['x'] + curr['width'])
-                overlap = max(0, end - start)
-                min_width = min(last['width'], curr['width'])
-                if overlap > min_width * 0.4:
-                    if curr['score'] > last['score']:
-                        final_results.pop()
-                        final_results.append(curr)
-                    keep_curr = False
-            if keep_curr:
-                final_results.append(curr)
-        result_str = "".join([m['char'] for m in final_results])
-        return result_str
-
-    def parse_staff_count(self, text):
-        try:
-            if not text or '/' not in text: return None
-            clean = "".join([c for c in text if c.isdigit() or c == '/'])
-            parts = clean.split('/')
-            if len(parts) < 2: return None
-            used = int(parts[0])
-            total = int(parts[1])
-            avail = total - used
-            if avail < 0: return None
-            return used, total, avail
-        except Exception:
-            return None
-
-    def parse_cost(self, text):
-        try:
-            if not text or '/' not in text: return None
-            clean = "".join([c for c in text if c.isdigit() or c == '/'])
-            parts = clean.split('/')
-            if len(parts) < 2: return None
-            cost_str = parts[1]
-            if not cost_str: return None
-            cost = int(cost_str)
-            if cost == 0: return 10
-            if cost < 0 or cost > 25: return None
-            return cost
-        except Exception:
-            return None
-
-
 class WoaBot:
     def _check_running(self):
         if not self.running:
             raise StopSignal()
 
-    def __init__(self, log_callback=None, config_callback=None):
+    def __init__(self, log_callback=None, config_callback=None, instance_id=1):
+        self.instance_id = instance_id
         self.last_staff_log_time = 0
         self.config_callback = config_callback
         self.adb = None
@@ -196,6 +75,29 @@ class WoaBot:
         self.TOWER_RED_BGR = (110, 112, 251)
         self.TOWER_GREEN_BGR = (153, 219, 94)
         self.TOWER_OFF_COLOR = (128, 111, 94)
+        # 塔台菜单中四个控制器的倒计时 OCR 区域 (x, y, w, h)，右上角顶点分别为 (320,387) (320,491) (320,595) (320,699)
+        self.TOWER_TIME_REGIONS = [
+            (320 - 110, 387, 110, 18),
+            (320 - 110, 491, 110, 18),
+            (320 - 110, 595, 110, 18),
+            (320 - 110, 699, 110, 18),
+        ]
+        # 塔台倒计时定时器：到期时间戳（0 表示未设置）
+        self._tower_delay_deadline = 0.0
+        # 四个延时按钮坐标（对应控制器1-4）
+        self.TOWER_DELAY_BUTTONS = [(362, 376), (362, 479), (362, 583), (362, 688)]
+        # 全部延时按钮
+        self.TOWER_DELAY_ALL_BTN = (362, 785)
+        # 记录哪些控制器是活跃的（启动时确定）
+        self._tower_active_slots = [False, False, False, False]
+        # 塔台是否已确认关闭（全部未开启）
+        self._tower_disabled = False
+        # 塔台图标 ROI 区域 (x, y, w, h)
+        self.TOWER_ICON_ROI = (549, 794, 53, 55)
+        # 塔台是否曾经开启过（用于"塔台关闭筛选全部"功能）
+        self._tower_was_active = False
+        # 塔台关闭后强制模式1（仅在塔台从开启变为关闭时触发）
+        self._tower_off_force_mode1 = False
         self.COLOR_LIGHT = (203, 191, 179)
         self.COLOR_DARK = (101, 85, 70)
         self.FILTER_MENU_BTN = (1537, 37)
@@ -207,11 +109,30 @@ class WoaBot:
             ((1542, 190), False), ((1535, 118), True), ((1540, 261), True),
             ((1533, 331), True), ((1537, 403), True), ((1542, 474), False)
         ]
+        self.enable_no_takeoff_mode = False
         self.enable_cancel_stand_filter = False
+        self.FILTER_POINT_A = (1535, 118)
+        self.FILTER_POINT_B = (1542, 190)
+        self._filter_side = 0
+        self._filter_side_switch_time = 0.0
+        self._filter_no_pending_switch = False
+        self._filter_no_pending_next_switch_time = 0.0
+        self._request_apply_mode3 = False
+        self._request_switch_mode1 = False
+        self._no_takeoff_logout_min = 0.0
+        self._no_takeoff_logout_max = 0.0
+        self._filter_switch_min = 3.0
+        self._filter_switch_max = 6.0
+        self._no_takeoff_logout_next_time = 0.0
         self._stat_approach = 0
         self._stat_depart = 0
         self._stat_stand_count = 0
         self._stat_stand_staff = 0
+        self._stat_session_approach = 0
+        self._stat_session_depart = 0
+        self._stat_session_stand_count = 0
+        self._stat_session_stand_staff = 0
+        self._stat_date = None
         self._stat_last_required_cost = None
         self.REGION_STATUS_TITLE = (20, 320, 190, 250)
         self.LIST_ROI_X = 1312
@@ -272,6 +193,49 @@ class WoaBot:
         if log_change:
             self.log(f">>> [配置] 随机任务选择: {'已开启' if enabled else '已关闭'}")
 
+    def set_no_takeoff_mode(self, enabled):
+        if self.enable_no_takeoff_mode == enabled:
+            return
+        self.enable_no_takeoff_mode = enabled
+        self.log(f">>> [配置] 不起飞模式: {'已开启' if enabled else '已关闭'}")
+        if enabled:
+            self._request_apply_mode3 = True
+        else:
+            # 关闭不起飞模式时，主循环中请求切回模式1
+            self._request_switch_mode1 = True
+
+    def set_no_takeoff_logout_interval(self, min_m, max_m):
+        try:
+            mn = float(min_m) if min_m is not None else 0.0
+            mx = float(max_m) if max_m is not None else 0.0
+            mn = max(0.0, mn)
+            mx = max(0.0, mx)
+            if mx < mn: mx = mn
+        except (TypeError, ValueError):
+            mn, mx = 0.0, 0.0
+        if self._no_takeoff_logout_min == mn and self._no_takeoff_logout_max == mx:
+            return
+        self._no_takeoff_logout_min = mn
+        self._no_takeoff_logout_max = mx
+        if mn == 0 and mx == 0:
+            self.log(">>> [配置] 不起飞模式小退间隔随机范围: 关闭")
+        else:
+            self.log(f">>> [配置] 不起飞模式小退间隔随机范围: {mn}-{mx} 分钟")
+
+    def set_filter_switch_interval(self, min_s, max_s):
+        try:
+            mn = float(min_s) if min_s is not None else 3.0
+            mx = float(max_s) if max_s is not None else 6.0
+            mn = max(0.5, mn)
+            mx = max(mn, mx)
+        except (TypeError, ValueError):
+            mn, mx = 3.0, 6.0
+        if self._filter_switch_min == mn and self._filter_switch_max == mx:
+            return
+        self._filter_switch_min = mn
+        self._filter_switch_max = mx
+        self.log(f">>> [配置] 无任务切换间隔随机范围: {mn}-{mx} 秒")
+
     def set_cancel_stand_filter_when_tower_off(self, enabled):
         if self.enable_cancel_stand_filter == enabled:
             return
@@ -308,6 +272,10 @@ class WoaBot:
                 return False
         return True
 
+    def _is_tower_icon_visible(self):
+        """检测塔台图标是否可见（ROI 内匹配 tower.png）"""
+        return self.safe_locate('tower.png', confidence=0.8, region=self.TOWER_ICON_ROI) is not None
+
     def _is_point_red(self, b, g, r):
         """检测点是否为红色（需延时）：R 主导，与绿/灰区分"""
         rb, rg, rr = self.TOWER_RED_BGR
@@ -325,6 +293,104 @@ class WoaBot:
                 if not self._is_pixel_dark(screen, x, y):
                     return False
         return True
+
+    def _matches_filter_mode3(self, screen):
+        """不起飞模式：菜单深色、(1542,474)深色，(1535,118)与(1542,190)有且仅有一个为深色，(1533,331)(1537,403)为浅色"""
+        mx, my = self.FILTER_MENU_BTN
+        if not self._is_pixel_dark(screen, mx, my):
+            return False
+        if not self._is_pixel_dark(screen, 1542, 474):
+            return False
+        if not self._is_pixel_light(screen, 1533, 331):
+            return False
+        if not self._is_pixel_light(screen, 1537, 403):
+            return False
+        a_dark = self._is_pixel_dark(screen, self.FILTER_POINT_A[0], self.FILTER_POINT_A[1])
+        b_dark = self._is_pixel_dark(screen, self.FILTER_POINT_B[0], self.FILTER_POINT_B[1])
+        return (a_dark and not b_dark) or (not a_dark and b_dark)
+
+    def _do_filter_switch(self):
+        """在(1535,118)与(1542,190)之间切换：点击当前非当前侧，使该侧变深、另一侧变浅"""
+        if self._filter_side == 0:
+            x, y = self.FILTER_POINT_B[0], self.FILTER_POINT_B[1]
+        else:
+            x, y = self.FILTER_POINT_A[0], self.FILTER_POINT_A[1]
+        self._click_filter_point(x, y)
+        self.sleep(0.3)
+        self._filter_side = 1 - self._filter_side
+        self._filter_side_switch_time = time.time()
+        self._filter_no_pending_switch = False
+        #self.log(f"📋 [筛选] 不起飞模式：切换至{'进场' if self._filter_side == 0 else '停机位'}侧")
+
+    def _do_no_takeoff_small_logout(self):
+        """不起飞模式小退：点击主界面 -> 0.5s -> 点击换机场 -> 4s -> 点击 first_start_2(10s内) -> 10s -> 等待主界面(60s内)"""
+        self._check_running()
+        loc = self.safe_locate('main_interface.png', region=self.REGION_MAIN_ANCHOR, confidence=0.8)
+        if not loc:
+            self.log("📋 [小退] 未找到主界面按钮，跳过本次小退")
+            return
+        self.adb.click(loc[0], loc[1], random_offset=5)
+        self.sleep(0.5)
+        if not self.find_and_click('change_airport.png', confidence=0.75, wait=0):
+            self.log("📋 [小退] 未找到更改机场按钮，跳过")
+            return
+        self.sleep(4.0)
+        t0 = time.time()
+        found_fs2 = False
+        while time.time() - t0 < 10.0:
+            self._check_running()
+            if self.find_and_click('first_start_2.png', wait=0.5):
+                found_fs2 = True
+                break
+            self.sleep(0.5)
+        if not found_fs2:
+            self.log("📋 [小退] 10s 内未找到 first_start_2，继续等待主界面")
+        self.sleep(10.0)
+        wait_main = time.time()
+        while time.time() - wait_main < 60.0:
+            self._check_running()
+            if self.safe_locate('main_interface.png', region=self.REGION_MAIN_ANCHOR, confidence=0.8):
+                self.log("📋 [小退] 已返回主界面，恢复处理")
+                return
+            self.sleep(1.0)
+        self.log("📋 [小退] 60s 内未检测到主界面，交由后续流程处理")
+
+    def _force_switch_filter_mode1(self):
+        """在主循环中强制将筛选状态切回模式1（仅待处理）"""
+        # 仅在主界面下尝试
+        if not self.safe_locate('main_interface.png', region=self.REGION_MAIN_ANCHOR, confidence=0.8):
+            return
+        screen = self.adb.get_screenshot()
+        if screen is None:
+            return
+        mx, my = self.FILTER_MENU_BTN
+        # 确保筛选菜单已展开
+        if self._is_pixel_light(screen, mx, my):
+            self._click_filter_point(mx, my)
+            self.sleep(0.5)
+            for _ in range(5):
+                screen = self.adb.get_screenshot()
+                if screen is None:
+                    break
+                if self._is_pixel_dark(screen, mx, my):
+                    break
+                self._click_filter_point(mx, my)
+                self.sleep(0.3)
+            screen = self.adb.get_screenshot()
+            if screen is None:
+                return
+        # 若已是模式1则不动，否则按模式1配置逐项修正
+        if self._matches_filter_mode(screen, self.FILTER_CHECK_POINTS_MODE1):
+            return
+        self.log("📋 [筛选] 关闭不起飞模式，强制切换至模式1(仅待处理)...")
+        for (x, y), want_light in self.FILTER_CHECK_POINTS_MODE1:
+            screen = self.adb.get_screenshot()
+            if screen is None:
+                break
+            is_light = self._is_pixel_light(screen, x, y)
+            if (want_light and not is_light) or (not want_light and is_light):
+                self._click_filter_point(x, y)
+                self.sleep(0.2)
 
     def _click_filter_point(self, x, y):
         self.adb.click(x, y, random_offset=5)
@@ -386,6 +452,7 @@ class WoaBot:
 
         is_mode1 = self._matches_filter_mode(screen, self.FILTER_CHECK_POINTS_MODE1)
         is_mode2 = self._matches_filter_mode(screen, self.FILTER_CHECK_POINTS_MODE2)
+        is_mode3 = self.enable_no_takeoff_mode and self._matches_filter_mode3(screen)
 
         def apply_mode(points_config):
             for (x, y), want_light in points_config:
@@ -397,13 +464,56 @@ class WoaBot:
                     self._click_filter_point(x, y)
                     self.sleep(0.2)
 
-        need_mode1_only = self.enable_cancel_stand_filter and self._is_tower_off(screen)
+        def apply_mode3():
+            """确保菜单深、(1542,474)深，(1533,331)(1537,403)浅，再根据 _filter_side 确保对应一侧深"""
+            for _ in range(8):
+                screen = self.adb.get_screenshot()
+                if screen is None:
+                    return
+                if self._is_pixel_light(screen, mx, my):
+                    self._click_filter_point(mx, my)
+                    self.sleep(0.3)
+                    continue
+                if not self._is_pixel_dark(screen, 1542, 474):
+                    self._click_filter_point(1542, 474)
+                    self.sleep(0.2)
+                    continue
+                if not self._is_pixel_light(screen, 1533, 331):
+                    self._click_filter_point(1533, 331)
+                    self.sleep(0.2)
+                    continue
+                if not self._is_pixel_light(screen, 1537, 403):
+                    self._click_filter_point(1537, 403)
+                    self.sleep(0.2)
+                    continue
+                ax, ay = self.FILTER_POINT_A[0], self.FILTER_POINT_A[1]
+                bx, by = self.FILTER_POINT_B[0], self.FILTER_POINT_B[1]
+                a_dark = self._is_pixel_dark(screen, ax, ay)
+                b_dark = self._is_pixel_dark(screen, bx, by)
+                want_a_dark = self._filter_side == 0
+                if want_a_dark and not a_dark:
+                    self._click_filter_point(ax, ay)
+                    self.sleep(0.2)
+                elif not want_a_dark and not b_dark:
+                    self._click_filter_point(bx, by)
+                    self.sleep(0.2)
+                else:
+                    break
+
+        # 不起飞模式优先：只要开启则强制进入模式3，不理会塔台关闭
+        if self.enable_no_takeoff_mode:
+            if not is_mode3:
+                self.log("📋 [筛选] 应用不起飞模式(动态筛选)...")
+                apply_mode3()
+                self._filter_side_switch_time = time.time()
+            return
+
+        need_mode1_only = self._tower_off_force_mode1
         if need_mode1_only and not is_mode1:
             self.log("📋 [筛选] 切换至仅待处理... (塔台已关闭)")
             apply_mode(self.FILTER_CHECK_POINTS_MODE1)
             return
 
-        # 模式1或模式2均可接受；启动时若已是模式2也无需切换
         if is_mode1 or is_mode2:
             return
         self.log("📋 [筛选] 状态异常，默认切换至仅待处理...")
@@ -456,8 +566,7 @@ class WoaBot:
             self.log(f"📋 [调试] 保存 list_detect 截图失败: {e}")
 
     def _run_pending_detection(self, list_roi_img):
-        """按行识别：每行只保留该行内置信度最高的类型，避免跨行竞争导致相似图标误判。
-        环境变量 LIST_DETECT_CONF：覆盖置信度阈值（如 0.7），Vulkan 渲染可尝试降低。"""
+        """按行识别：每行只保留该行内置信度最高的类型，避免跨行竞争导致相似图标误判。"""
         base_defs = [
             ('pending_ice.png', self.handle_ice_task, 0.8, 'ice'),
             ('pending_repair.png', self.handle_repair_task, 0.8, 'repair'),
@@ -734,13 +843,16 @@ class WoaBot:
         self.in_staff_shortage_mode = False
         self.last_checked_avail_staff = -1
         self.last_window_close_time = time.time()
-        self.auto_delay_count = 0
-        if self.config_callback:
-            self.config_callback("auto_delay_count", 0)
         # 初始化计数器
         self.consecutive_timeout_count = 0
         self.consecutive_errors = 0
         self.last_recovery_time = 0
+        # 重置塔台状态
+        self._tower_disabled = False
+        self._tower_was_active = False
+        self._tower_off_force_mode1 = False
+        self._tower_delay_deadline = 0.0
+        self._tower_active_slots = [False, False, False, False]
 
         if not self.target_device:
             self.log("❌ 未选择设备！")
@@ -752,6 +864,7 @@ class WoaBot:
                 target_device=self.target_device,
                 control_method=self.control_method,
                 screenshot_method=self.screenshot_method,
+                instance_id=self.instance_id,
             )
             self.adb.set_mumu_path(self.mumu_path)
             if self.config_callback:
@@ -831,7 +944,10 @@ class WoaBot:
             else:
                 dur = f"{m}分{s}秒"
             self.log(f"[统计] 本次运行时长: {dur}")
-        a, d, sc, ss = self._stat_approach, self._stat_depart, self._stat_stand_count, self._stat_stand_staff
+        a = getattr(self, "_stat_session_approach", self._stat_approach)
+        d = getattr(self, "_stat_session_depart", self._stat_depart)
+        sc = getattr(self, "_stat_session_stand_count", self._stat_stand_count)
+        ss = getattr(self, "_stat_session_stand_staff", self._stat_stand_staff)
         if a + d + sc == 0:
             return
         self.log(f"[统计] ═══════════════════════════════════")
@@ -840,41 +956,58 @@ class WoaBot:
         self.log(f"[统计]  ✈ 分配地勤:  {sc} 架次 / {ss} 人次")
         self.log(f"[统计] ═══════════════════════════════════")
 
-    def _save_stats_to_csv(self):
+    def _add_stats_to_csv_date(self, target_date, a, d, sc, ss):
+        """将 (a,d,sc,ss) 累加到 CSV 中 target_date 所在行。若 a+d+sc==0 则不写。
+        所有实例共用同一个 woa_stats.csv，使用文件锁防止并发写入冲突。"""
         import csv
-        a, d, sc, ss = self._stat_approach, self._stat_depart, self._stat_stand_count, self._stat_stand_staff
         if a + d + sc == 0:
             return
         try:
-            csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "woa_stats.csv")
-            today = time.strftime("%Y-%m-%d")
-            rows = []
+            base_dir = os.path.dirname(os.path.abspath(__file__)) if not getattr(sys, "frozen", False) else os.path.dirname(sys.executable)
+            csv_path = os.path.join(base_dir, "woa_stats.csv")
+            lock_path = csv_path + ".lock"
             header = ["date", "approach", "depart", "stand_count", "stand_staff"]
-            if os.path.isfile(csv_path):
-                with open(csv_path, "r", encoding="utf-8-sig") as f:
-                    reader = csv.reader(f)
-                    for i, row in enumerate(reader):
-                        if i == 0 and row and row[0].strip().lower() == "date":
-                            continue
-                        if len(row) >= 5:
-                            rows.append(row)
-            found = False
-            for row in rows:
-                if row[0] == today:
-                    row[1] = str(int(row[1]) + a)
-                    row[2] = str(int(row[2]) + d)
-                    row[3] = str(int(row[3]) + sc)
-                    row[4] = str(int(row[4]) + ss)
-                    found = True
-                    break
-            if not found:
-                rows.append([today, str(a), str(d), str(sc), str(ss)])
-            with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(rows)
+            # 使用文件锁保证多实例安全
+            import msvcrt
+            with open(lock_path, "w") as lf:
+                lf.write("1")
+                lf.flush()
+                msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    rows = []
+                    if os.path.isfile(csv_path):
+                        with open(csv_path, "r", encoding="utf-8-sig") as f:
+                            reader = csv.reader(f)
+                            for i, row in enumerate(reader):
+                                if i == 0 and row and row[0].strip().lower() == "date":
+                                    continue
+                                if len(row) >= 5:
+                                    rows.append(row)
+                    found = False
+                    for row in rows:
+                        if row[0] == target_date:
+                            row[1] = str(int(row[1]) + a)
+                            row[2] = str(int(row[2]) + d)
+                            row[3] = str(int(row[3]) + sc)
+                            row[4] = str(int(row[4]) + ss)
+                            found = True
+                            break
+                    if not found:
+                        rows.append([target_date, str(a), str(d), str(sc), str(ss)])
+                    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(header)
+                        writer.writerows(rows)
+                finally:
+                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
         except Exception as e:
             self.log(f"⚠️ 保存统计数据失败: {e}")
+
+    def _save_stats_to_csv(self):
+        """停止时将当日累计写入 CSV（本次运行 0 点后的部分）"""
+        a, d, sc, ss = self._stat_approach, self._stat_depart, self._stat_stand_count, self._stat_stand_staff
+        today = time.strftime("%Y-%m-%d")
+        self._add_stats_to_csv_date(today, a, d, sc, ss)
 
     @staticmethod
     def _async_close_adb(adb):
@@ -906,24 +1039,75 @@ class WoaBot:
 
     def _do_main_loop(self):
         self._run_start_time = time.time()
+        self._stat_date = time.strftime("%Y-%m-%d")
         self.log("[DEBUG] 主循环线程已启动")
         self.sleep(1.0)
         self.last_periodic_check_time = 0
+        if self.enable_no_takeoff_mode:
+            self._filter_side_switch_time = time.time()
         self._periodic_15s_check(force_initial_filter_check=True)
+        if self.enable_no_takeoff_mode and self._no_takeoff_logout_max > 0:
+            self._no_takeoff_logout_next_time = time.time() + random.uniform(self._no_takeoff_logout_min, self._no_takeoff_logout_max) * 60
+        # 启动时读取塔台倒计时
+        try:
+            self._init_tower_countdown()
+        except StopSignal:
+            raise
+        except Exception as e:
+            self.log(f"🗼 [塔台] ⚠️ 初始化塔台失败: {e}，跳过")
+            self._tower_disabled = True
         idle_count = 0
         gc_counter = 0
         while self.running:
             try:
+                now_date = time.strftime("%Y-%m-%d")
+                if self._stat_date and now_date != self._stat_date:
+                    a, d, sc, ss = self._stat_approach, self._stat_depart, self._stat_stand_count, self._stat_stand_staff
+                    self._add_stats_to_csv_date(self._stat_date, a, d, sc, ss)
+                    if a + d + sc > 0:
+                        self.log(f"[统计] 已跨 0 点，将 {self._stat_date} 的统计写入 CSV（进场 {a} / 离场 {d} / 地勤 {sc} 架 {ss} 人次）")
+                    self._stat_approach = 0
+                    self._stat_depart = 0
+                    self._stat_stand_count = 0
+                    self._stat_stand_staff = 0
+                    self._stat_date = now_date
+                if getattr(self, '_request_apply_mode3', False):
+                    self._request_apply_mode3 = False
+                    self._periodic_15s_check(force_initial_filter_check=True)
+                    if self.enable_no_takeoff_mode and self._no_takeoff_logout_max > 0:
+                        self._no_takeoff_logout_next_time = time.time() + random.uniform(self._no_takeoff_logout_min, self._no_takeoff_logout_max) * 60
+                if getattr(self, '_request_switch_mode1', False):
+                    self._request_switch_mode1 = False
+                    self._force_switch_filter_mode1()
+                if self.enable_no_takeoff_mode and self._no_takeoff_logout_max > 0 and self._no_takeoff_logout_next_time > 0 and time.time() >= self._no_takeoff_logout_next_time:
+                    self.log("📋 [小退] 到达小退间隔，执行小退...")
+                    self._do_no_takeoff_small_logout()
+                    self._no_takeoff_logout_next_time = time.time() + random.uniform(self._no_takeoff_logout_min, self._no_takeoff_logout_max) * 60
+                # 检查塔台倒计时是否到期
+                if self._check_tower_countdown():
+                    idle_count = 0
+                    continue
                 did_work = self.scan_and_process()
                 if did_work:
+                    self._filter_no_pending_switch = False
+                    self._filter_no_pending_next_switch_time = 0.0
+                    if self.enable_no_takeoff_mode and time.time() - self._filter_side_switch_time >= 15:
+                        self._do_filter_switch()
                     self.sleep(0.05)
                     idle_count = 0
                 else:
+                    if self.enable_no_takeoff_mode and self._filter_no_pending_switch:
+                        t = time.time()
+                        if self._filter_no_pending_next_switch_time == 0:
+                            self._do_filter_switch()
+                            self._filter_no_pending_next_switch_time = t + random.uniform(self._filter_switch_min, self._filter_switch_max)
+                        elif t >= self._filter_no_pending_next_switch_time:
+                            self._do_filter_switch()
+                            self._filter_no_pending_next_switch_time = t + random.uniform(self._filter_switch_min, self._filter_switch_max)
                     self.sleep(0.5)
                     idle_count += 1
-                    if idle_count >= 3:
+                    if idle_count == 3:
                         self.close_window()
-                        idle_count = 0
                 gc_counter += 1
                 if gc_counter > 50:
                     gc.collect()
@@ -1116,16 +1300,294 @@ class WoaBot:
                 self.log(f"📊 [状态监测] 可用地勤: {self.last_checked_avail_staff} -> {val}")
             self.last_checked_avail_staff = val
 
-    def _check_and_perform_auto_delay(self):
-        if self.auto_delay_count <= 0: return False
+    def _read_tower_times(self, open_menu=True):
+        """OCR 读取四个控制器的倒计时，返回 [秒数, ...] 列表（读取失败的为 None）
+        open_menu=True 时智能判断是否需要关窗再打开塔台菜单；False 时假设菜单已打开。
+        注意：此方法不关闭菜单，由调用方负责。"""
+        if open_menu:
+            # 先检测塔台图标是否可见，可见则无需关窗
+            if self._is_tower_icon_visible():
+                self.log("🗼 [塔台] 塔台图标可见，直接打开菜单...")
+            else:
+                self.log("🗼 [塔台] 塔台图标不可见，先关闭窗口...")
+                self.close_window()
+                self.sleep(0.5)
+            self.adb.click(646, 822)
+            self.sleep(1.0)
+        else:
+            self.log("🗼 [塔台] 菜单已打开，直接读取...")
+        screen = self.adb.get_screenshot()
+        if screen is None:
+            self.log("🗼 [塔台] ⚠️ 截图失败，无法读取控制器时间")
+            return [None, None, None, None]
+        times = []
+        for i, region in enumerate(self.TOWER_TIME_REGIONS):
+            text = self.ocr.recognize_number(region, mode='task', screen_image=screen)
+            secs = self.ocr.parse_tower_time(text)
+            if secs is not None:
+                self.log(f"   塔台控制器 {i+1}: {text} ({secs}s)")
+            else:
+                self.log(f"   塔台控制器 {i+1}: 无有效数字 (raw={text})")
+            times.append(secs)
+        return times
+
+    def _close_tower_menu(self):
+        """关闭塔台菜单"""
+        self.log("🗼 [塔台] 关闭塔台菜单...")
+        if not self.wait_and_click('back.png', timeout=3.0, click_wait=0.5, random_offset=2):
+            self.log("🗼 [塔台] 未找到返回按钮，使用 close_window 关闭")
+            self.close_window()
+
+    def _init_tower_countdown(self):
+        """启动时读取塔台倒计时，判断哪些控制器活跃，设置定时器。
+        先通过 tower.png 可见性 + 像素灰度判断塔台是否关闭，避免不必要的菜单操作。"""
+        self.log("🗼 [塔台] 启动初始化：检测塔台图标...")
+        # 第一步：检测 ROI 内是否有 tower.png
+        icon_visible = self._is_tower_icon_visible()
+        if not icon_visible:
+            # 图标不可见，可能被窗口遮挡，先关窗再检测
+            self.log("🗼 [塔台] 塔台图标不可见，尝试关闭窗口后重新检测...")
+            self.close_window()
+            self.sleep(0.5)
+            icon_visible = self._is_tower_icon_visible()
+        if not icon_visible:
+            # 关窗后仍不可见，无法确认塔台状态，跳过
+            self.log("🗼 [塔台] 关窗后塔台图标仍不可见，无法确认塔台状态，跳过初始化")
+            return
+        # 第二步：图标可见，用像素检测判断塔台是否全灰（关闭）
+        screen = self.adb.get_screenshot()
+        if screen is not None and self._is_tower_off(screen):
+            self._tower_disabled = True
+            self._tower_delay_deadline = 0.0
+            self._tower_active_slots = [False, False, False, False]
+            self.log("🗼 [塔台] 塔台图标全灰，判定塔台已关闭，不打开菜单")
+            return
+        # 第三步：塔台非灰色，打开菜单读取时间
+        self.log("🗼 [塔台] 塔台图标可见且非灰色，打开菜单读取控制器状态...")
+        self.adb.click(646, 822)
+        self.sleep(1.0)
+        times = self._read_tower_times(open_menu=False)
+        # 判断活跃状态
+        active = [t is not None and t > 0 for t in times]
+        active_count = sum(active)
+        self.log(f"🗼 [塔台] OCR 结果: {times}，活跃数: {active_count}/4")
+        if active_count == 0:
+            self._tower_disabled = True
+            self._tower_delay_deadline = 0.0
+            self._tower_active_slots = [False, False, False, False]
+            self.log("🗼 [塔台] 四个控制器均未开启，塔台已关闭，以后不再打开菜单")
+            self._close_tower_menu()
+            return
+        self._tower_active_slots = active
+        self._tower_disabled = False
+        self._tower_was_active = True
+        slots_str = ",".join([str(i+1) for i, a in enumerate(active) if a])
+        valid_times = [t for t, a in zip(times, active) if a]
+        min_time = min(valid_times)
+        max_time = max(valid_times)
+        if self.auto_delay_count > 0:
+            # 检查是否有控制器已经 < 3分钟，需要立即延时
+            needs_delay_now = [False, False, False, False]
+            urgent = False
+            for i in range(4):
+                if active[i] and times[i] is not None and times[i] < 180:
+                    needs_delay_now[i] = True
+                    urgent = True
+            if urgent:
+                urgent_slots = [i+1 for i in range(4) if needs_delay_now[i]]
+                self.log(f"🗼 [塔台] ⚠️ 控制器 {urgent_slots} 剩余不足3分钟，立即执行延时！")
+                self._perform_tower_delay(needs_delay_now, menu_already_open=True)
+                return
+            # 自动延时已开启：提前3分钟触发
+            trigger_in = max(0, min_time - 180)
+            self._tower_delay_deadline = time.time() + trigger_in
+            mins, secs = divmod(int(min_time), 60)
+            self.log(f"🗼 [塔台] 自动延时已开启(剩余{self.auto_delay_count}次)，活跃控制器: [{slots_str}]")
+            self.log(f"🗼 [塔台] 最短剩余 {mins}m{secs}s，将在 {int(trigger_in)}s 后触发延时检查")
+        else:
+            # 自动延时未开启：在最长时间到期后+10s 再打开菜单确认状态
+            trigger_in = max_time + 10
+            self._tower_delay_deadline = time.time() + trigger_in
+            mins, secs = divmod(int(max_time), 60)
+            self.log(f"🗼 [塔台] 自动延时未开启，活跃控制器: [{slots_str}]")
+            self.log(f"🗼 [塔台] 最长剩余 {mins}m{secs}s，将在 {int(trigger_in)}s 后重新确认塔台状态")
+        self._close_tower_menu()
+
+    def _check_tower_countdown(self):
+        """检查塔台倒计时是否到期。
+        - 自动延时开启时：到期则打开菜单重新读取，延时 <10min 的控制器
+        - 自动延时未开启时：到期则打开菜单确认塔台状态（监控模式）"""
+        if self._tower_delay_deadline <= 0 or self._tower_disabled:
+            return False
+        if time.time() < self._tower_delay_deadline:
+            return False
+        self._tower_delay_deadline = 0.0
+
+        if self.auto_delay_count <= 0:
+            # 监控模式：自动延时未开启，只是确认塔台状态
+            self.log("🗼 [塔台] 监控到期，打开菜单确认塔台状态...")
+            times = self._read_tower_times(open_menu=True)
+            active = [t is not None and t > 0 for t in times]
+            active_count = sum(active)
+            self.log(f"🗼 [塔台] OCR 结果: {times}，活跃数: {active_count}/4")
+            if active_count == 0:
+                self._tower_disabled = True
+                self._tower_active_slots = [False, False, False, False]
+                self.log("🗼 [塔台] 四个控制器均已关闭，以后不再打开菜单")
+                if self._tower_was_active and self.enable_cancel_stand_filter:
+                    self._tower_off_force_mode1 = True
+                    self.log("🗼 [塔台] 塔台从开启变为关闭，启用强制筛选模式1")
+            else:
+                self._tower_active_slots = active
+                valid_times = [t for t, a in zip(times, active) if a]
+                max_time = max(valid_times)
+                trigger_in = max_time + 10
+                self._tower_delay_deadline = time.time() + trigger_in
+                mins, secs = divmod(int(max_time), 60)
+                slots_str = ",".join([str(i+1) for i, a in enumerate(active) if a])
+                self.log(f"🗼 [塔台] 活跃控制器: [{slots_str}]，最长剩余 {mins}m{secs}s")
+                self.log(f"🗼 [塔台] 将在 {int(trigger_in)}s 后再次确认塔台状态")
+            self._close_tower_menu()
+            return True
+
+        # 延时模式：自动延时已开启
+        self.log("🗼 [塔台] 延时倒计时到期，打开菜单检查剩余时间...")
+        times = self._read_tower_times(open_menu=True)
+        self.log(f"🗼 [塔台] OCR 结果: {times}")
+        # 先检查是否全部关闭（全 None）
+        active = [t is not None and t > 0 for t in times]
+        if sum(active) == 0:
+            self._tower_disabled = True
+            self._tower_active_slots = [False, False, False, False]
+            self.log("🗼 [塔台] 四个控制器均已关闭，塔台已关闭")
+            if self._tower_was_active and self.enable_cancel_stand_filter:
+                self._tower_off_force_mode1 = True
+                self.log("🗼 [塔台] 塔台从开启变为关闭，启用强制筛选模式1")
+            self._close_tower_menu()
+            return True
+        # 判断哪些活跃控制器需要延时（< 10分钟）
+        needs_delay = [False, False, False, False]
+        any_need = False
+        for i in range(4):
+            if self._tower_active_slots[i] and times[i] is not None and times[i] < 600:
+                needs_delay[i] = True
+                any_need = True
+                self.log(f"🗼 [塔台] 控制器 {i+1} 剩余 {int(times[i])}s < 600s，需要延时")
+        if not any_need:
+            # 没有需要延时的，重新设置下次 deadline
+            self.log("🗼 [塔台] 所有活跃控制器均 >= 10分钟，暂不延时")
+            valid_times = [t for t, a in zip(times, self._tower_active_slots) if a and t is not None and t > 0]
+            if valid_times:
+                min_time = min(valid_times)
+                trigger_in = max(0, min_time - 180)
+                self._tower_delay_deadline = time.time() + trigger_in
+                self.log(f"🗼 [塔台] 将在 {int(trigger_in)}s 后再次检查")
+            self._close_tower_menu()
+            return True
+        # 菜单已打开，直接执行延时（不关菜单）
+        self.log(f"🗼 [塔台] 需要延时的控制器: {[i+1 for i in range(4) if needs_delay[i]]}")
+        self._perform_tower_delay(needs_delay, menu_already_open=True)
+        return True
+
+    def _perform_tower_delay(self, needs_delay, menu_already_open=False):
+        """执行塔台延时操作。needs_delay: [bool]*4 表示哪些控制器需要延时。
+        menu_already_open=True 时假设菜单已打开。"""
+        delay_slots = [i+1 for i in range(4) if needs_delay[i]]
+        self.log(f"🗼 [塔台] 开始延时操作，目标控制器: {delay_slots}，菜单已打开: {menu_already_open}")
+        if not menu_already_open:
+            self.close_window()
+            self.sleep(0.3)
+            self.adb.click(646, 822)
+            self.sleep(0.8)
+        # 判断是否全部活跃且全部需要延时 → 用全部延时按钮
+        all_active = all(self._tower_active_slots)
+        all_need = all(n for n, a in zip(needs_delay, self._tower_active_slots) if a)
+        confirm_success = False
+        if all_active and all_need:
+            # 全部延时
+            self.log("   -> 点击全部延时按钮")
+            self.adb.click(*self.TOWER_DELAY_ALL_BTN)
+            self.sleep(1.0)
+            for attempt in range(3):
+                res = self.adb.locate_image(self.icon_path + 'delay.png', confidence=0.8)
+                if res:
+                    self.log(f"   -> 发现确认按钮，第 {attempt+1} 次点击...")
+                    self.adb.click(res[0], res[1])
+                    self.sleep(0.5)
+                    if not self.adb.locate_image(self.icon_path + 'delay.png', confidence=0.8):
+                        confirm_success = True
+                        break
+                else:
+                    self.sleep(0.5)
+        else:
+            # 逐个延时
+            any_ok = False
+            for i in range(4):
+                if not needs_delay[i]:
+                    continue
+                self.log(f"   -> 点击控制器 {i+1} 延时按钮")
+                self.adb.click(*self.TOWER_DELAY_BUTTONS[i])
+                self.sleep(1.0)
+                # 寻找 delay_1.png 并点击
+                res = self.adb.locate_image(self.icon_path + 'delay_1.png', confidence=0.8)
+                if res:
+                    self.adb.click(res[0], res[1])
+                    self.sleep(0.4)
+                    # 寻找 yes.png 并点击
+                    self.wait_and_click('yes.png', timeout=2.0, click_wait=0.5, random_offset=2)
+                    self.sleep(0.5)
+                    if not self.adb.locate_image(self.icon_path + 'yes.png', confidence=0.8):
+                        self.log(f"   -> 控制器 {i+1} 延时确认成功")
+                        any_ok = True
+                    else:
+                        self.log(f"   -> 控制器 {i+1} 延时确认失败")
+                else:
+                    self.log(f"   -> 控制器 {i+1} 未找到确认按钮")
+            confirm_success = any_ok
+        if confirm_success:
+            self.log(f"   -> ✅ 延时操作完成，剩余延时次数: {self.auto_delay_count - 1}")
+            self.auto_delay_count -= 1
+            if self.config_callback:
+                self.config_callback("auto_delay_count", self.auto_delay_count)
+            # 延时确认后等待1s，此时仍在塔台页面，直接读取时间
+            self.sleep(1.0)
+            self.log("🗼 [塔台] 延时确认后，直接读取当前倒计时...")
+            times = self._read_tower_times(open_menu=False)
+            valid_times = [t for t, a in zip(times, self._tower_active_slots) if a and t is not None and t > 0]
+            if valid_times:
+                min_time = min(valid_times)
+                trigger_in = max(0, min_time - 180)
+                self._tower_delay_deadline = time.time() + trigger_in
+                mins, secs = divmod(int(min_time), 60)
+                self.log(f"🗼 [塔台] 最短剩余 {mins}m{secs}s，{int(trigger_in)}s 后执行下次延时")
+            else:
+                self._tower_delay_deadline = 0.0
+                self.log("🗼 [塔台] ⚠️ 延时后未能读取到有效时间")
+            self._close_tower_menu()
+        else:
+            self.log("   -> ⚠️ 未能确认延时")
+            self._tower_delay_deadline = 0.0
+            self._close_tower_menu()
+        return True
+
+    def _check_and_perform_auto_delay(self, screen=None):
+        if self.auto_delay_count <= 0 or self._tower_disabled: return False
 
         if time.time() < self.doing_task_forbidden_until:
             return False
 
-        screen = self.adb.get_screenshot()
+        # 先检查塔台图标是否可见，确保当前在主界面
+        if not self._is_tower_icon_visible():
+            # 图标不可见，可能被窗口遮挡，先关窗再检测
+            self.close_window()
+            self.sleep(0.5)
+            if not self._is_tower_icon_visible():
+                # 关窗后仍不可见，不可信，跳过
+                return False
+
+        if screen is None:
+            screen = self.adb.get_screenshot()
         if screen is None: return False
-        if self._is_tower_off(screen):
-            return False
         is_triggered = False
         for (x, y) in self.TOWER_CHECK_POINTS:
             try:
@@ -1137,31 +1599,28 @@ class WoaBot:
                 pass
         if is_triggered:
             self.log(f"🚨 [最高优] 监测到自动塔台红灯...")
+            # 打开塔台菜单，读取时间
+            self.close_window()
+            self.sleep(0.3)
             self.adb.click(646, 822)
             self.sleep(0.8)
-            self.adb.click(362, 785)
-            self.sleep(1.0)
-            confirm_success = False
-            for i in range(3):
-                res = self.adb.locate_image(self.icon_path + 'delay.png', confidence=0.8)
-                if res:
-                    self.log(f"   -> 发现确认按钮，第 {i + 1} 次点击...")
-                    self.adb.click(res[0], res[1])
-                    self.sleep(0.5)
-                    if not self.adb.locate_image(self.icon_path + 'delay.png', confidence=0.8):
-                        confirm_success = True
-                        break
-                else:
-                    self.sleep(0.5)
-            if confirm_success:
-                self.log("   -> ✅ 延时确认成功")
-                self.auto_delay_count -= 1
-                if self.config_callback: self.config_callback("auto_delay_count", self.auto_delay_count)
+            times = self._read_tower_times(open_menu=False)
+            self.log(f"🗼 [塔台] 红灯触发 OCR 结果: {times}")
+            # 判断哪些活跃控制器需要延时（< 2分钟，紧急）
+            needs_delay = [False, False, False, False]
+            for i in range(4):
+                if self._tower_active_slots[i] and times[i] is not None and times[i] < 120:
+                    needs_delay[i] = True
+                    self.log(f"🗼 [塔台] 控制器 {i+1} 剩余 {int(times[i])}s < 120s，紧急延时")
+            if any(needs_delay):
+                # 菜单已打开，直接延时
+                self.log(f"🗼 [塔台] 紧急延时控制器: {[i+1 for i in range(4) if needs_delay[i]]}")
+                self._perform_tower_delay(needs_delay, menu_already_open=True)
             else:
-                self.log("   -> ⚠️ 未能确认延时")
-            self.sleep(0.5)
-            if not self.wait_and_click('back.png', timeout=4.0, click_wait=0.5, random_offset=2):
-                self.close_window()
+                # 全部活跃的都延时（红灯说明至少有一个快到期了）
+                needs_all = [a for a in self._tower_active_slots]
+                self.log(f"🗼 [塔台] 无 <2min 控制器，对所有活跃控制器执行延时")
+                self._perform_tower_delay(needs_all, menu_already_open=True)
             return True
         return False
 
@@ -1220,6 +1679,7 @@ class WoaBot:
             self._check_running()
             if self.find_and_click('landing_permitted.png', wait=0):
                 self._stat_approach += 1
+                self._stat_session_approach += 1
                 self.sleep(0.05)
                 return True
             screen = self.adb.get_screenshot()
@@ -1239,6 +1699,7 @@ class WoaBot:
                         self._check_running()
                         if self.find_and_click('landing_permitted.png', wait=0):
                             self._stat_approach += 1
+                            self._stat_session_approach += 1
                             self.sleep(0.05)
                             return True
 
@@ -1315,7 +1776,7 @@ class WoaBot:
                             self.log("🛑 领奖流程卡死")
                             return False
                         self.log("   -> 领奖确认，等待开始检测下一步...")
-                        self.sleep(1.6)
+                        self.sleep(1.4)
                         t3_timeout = 1.0 if sm in ('nemu_ipc', 'uiautomator2') else 2.0
                         t3_start = time.time()
                         while time.time() - t3_start < t3_timeout:
@@ -1331,6 +1792,7 @@ class WoaBot:
                                 if res_final:
                                     if final_btn in ('push_back.png', 'taxi_to_runway.png'):
                                         self._stat_depart += 1
+                                        self._stat_session_depart += 1
                                     self.adb.click(res_final[0] + bx, res_final[1] + by)
                                     self.log("   -> ✅ 离场动作执行完毕")
                                     return True
@@ -1343,6 +1805,7 @@ class WoaBot:
                         return True
                     if btn in ('push_back.png', 'taxi_to_runway.png'):
                         self._stat_depart += 1
+                        self._stat_session_depart += 1
                     self.adb.click(x, y)
                     self.sleep(0.5)          
                     return True
@@ -1518,8 +1981,8 @@ class WoaBot:
         agent_x = int(random.gauss(803, 5))
         agent_y = int(random.gauss(646, 5))
         self.adb.click(agent_x, agent_y)
-
         self.sleep(0.3)
+
         if self.safe_locate('insufficient_ground_staff.png', confidence=0.7):
             self.log("🛑 警告：人员不足 (盲操作后检测)")
             self.in_staff_shortage_mode = True
@@ -1533,6 +1996,7 @@ class WoaBot:
         else:
             if self.enable_skip_staff and force_verify:
                 self.log("   -> [安全] 地勤人数未知，强制执行验证")
+            self.sleep(0.2)
             check_x, check_y = 63, 546
             b, g, r = self.adb.get_pixel_color(check_x, check_y)
             target_b, target_g, target_r = 153, 220, 96
@@ -1560,9 +2024,12 @@ class WoaBot:
 
         if self.wait_and_click('start_ground_support.png', timeout=2.0, click_wait=0):
             self._stat_stand_count += 1
+            self._stat_session_stand_count += 1
             cost = self._stat_last_required_cost
             if cost is not None:
-                self._stat_stand_staff += cost + 1
+                add_staff = cost + 1
+                self._stat_stand_staff += add_staff
+                self._stat_session_stand_staff += add_staff
             self.sleep(0.5)
             return True
         else:
@@ -1618,24 +2085,47 @@ class WoaBot:
 
     def scan_and_process(self):
         if self.auto_delay_count > 0:
-            if time.time() - self.last_window_close_time > 80:
+            if time.time() - self.last_window_close_time > 40:
                 self.log("🛡️ [防遮挡] 强制关窗以检测塔台...")
                 self.close_window()
-                self.sleep(2.5)
+                deadline = time.time() + 2.5
+                while time.time() < deadline:
+                    self.sleep(0.3)
+                    if self._check_and_perform_auto_delay():
+                        return True
                 return True
 
-        if self._check_and_perform_auto_delay(): return True
+        self._check_and_recover_interface()
+        self._periodic_15s_check()
+
+        current_screen = self.adb.get_screenshot()
+        if current_screen is None:
+            if not hasattr(self, '_scan_screenshot_fails'):
+                self._scan_screenshot_fails = 0
+            self._scan_screenshot_fails += 1
+            if self._scan_screenshot_fails >= 5:
+                self.log(f"⚠️ [连接] 截图连续{self._scan_screenshot_fails}次失败，尝试重建 ADB 连接...")
+                self._scan_screenshot_fails = 0
+                try:
+                    self.adb.connect()
+                    self.adb._start_persistent_shell()
+                except Exception as e:
+                    self.log(f"⚠️ [连接] ADB 重连异常: {e}")
+                self.sleep(1.0)
+            return False
+        self._scan_screenshot_fails = 0
+
         if not hasattr(self, 'last_staff_check_time'): self.last_staff_check_time = 0
         now = time.time()
         prev_staff = self.last_checked_avail_staff
         staff_this_round = None
         if now - self.last_staff_check_time > 3.0:
-            staff_this_round = self.check_global_staff()
+            staff_this_round = self.check_global_staff(screen_image=current_screen)
             self._update_staff_tracker(staff_this_round)
             self.last_staff_check_time = now
 
         if self.in_staff_shortage_mode or self.stand_skip_index > 0:
-            current_avail = staff_this_round if staff_this_round is not None else self.check_global_staff()
+            current_avail = staff_this_round if staff_this_round is not None else self.check_global_staff(screen_image=current_screen)
             if current_avail is not None:
                 is_blind_recovery = (prev_staff >= 900) and (current_avail < 900)
                 is_changed = (prev_staff != -1) and (current_avail != prev_staff)
@@ -1647,12 +2137,7 @@ class WoaBot:
                     self.stand_skip_index = 0
                 self.last_checked_avail_staff = current_avail
 
-        self._check_and_recover_interface()
-        self._periodic_15s_check()
-
-        current_screen = self.adb.get_screenshot()
-        if current_screen is None:
-            return False
+        if self._check_and_perform_auto_delay(current_screen): return True
         lx, ly, lw, lh = self.LIST_ROI_X, 0, self.LIST_ROI_W, self.LIST_ROI_H
         list_roi_img = current_screen[ly:ly + lh, lx:lx + lw]
         bx, by, bw, bh = self.REGION_BOTTOM_ROI
@@ -1691,6 +2176,8 @@ class WoaBot:
             valid_candidates.append(t)
 
         if not valid_candidates:
+            if self.enable_no_takeoff_mode:
+                self._filter_no_pending_switch = True
             if not getattr(self, '_log_detect_once', False):
                 self._log_detect_once = True
                 n_doing = len(doing_tasks)
