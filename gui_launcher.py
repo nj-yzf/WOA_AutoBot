@@ -84,7 +84,7 @@ if INSTANCE_ID is None:
 
 # 按实例隔离配置和统计文件
 CONFIG_FILE = "config.json" if INSTANCE_ID == 1 else f"config_{INSTANCE_ID}.json"
-STATS_FILE = "woa_stats.csv" if INSTANCE_ID == 1 else f"woa_stats_{INSTANCE_ID}.csv"
+STATS_FILE = "woa_stats.csv"
 
 LOCAL_VERSION = "v1.2.6"
 _GITEE_RAW_URL = "https://gitee.com/shuang-nagi/WOA_AutoBot/raw/master/{}"
@@ -310,16 +310,21 @@ class MultiTextRedirector(object):
     def _flush_queue(self):
         """在主线程中调用，将队列中的日志写入 tkinter 控件"""
         count = 0
+        batch = []
         while not self._queue.empty() and count < 50:
             try:
-                txt1, tag1, txt2, tag2 = self._queue.get_nowait()
+                batch.append(self._queue.get_nowait())
             except queue.Empty:
                 break
-            for w in self.widgets:
-                try:
-                    if not w.winfo_exists():
-                        continue
-                    w.configure(state="normal")
+            count += 1
+        if not batch:
+            return
+        for w in self.widgets:
+            try:
+                if not w.winfo_exists():
+                    continue
+                w.configure(state="normal")
+                for txt1, tag1, txt2, tag2 in batch:
                     w.insert("end", txt1, (tag1,))
                     if txt2:
                         w.insert("end", txt2, (tag2,))
@@ -328,13 +333,12 @@ class MultiTextRedirector(object):
                             w.delete("1.0", "2.0")
                     except Exception:
                         pass
-                    w.see("end")
-                    w.configure(state="disabled")
-                except (tk.TclError, RuntimeError):
-                    pass
-                except Exception:
-                    pass
-            count += 1
+                w.see("end")
+                w.configure(state="disabled")
+            except (tk.TclError, RuntimeError):
+                pass
+            except Exception:
+                pass
 
     def flush(self):
         pass
@@ -972,7 +976,8 @@ class Application(ttkb.Window):
         import csv
         from datetime import datetime, timedelta, date as date_type
 
-        csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATS_FILE)
+        _base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+        csv_path = os.path.join(_base, STATS_FILE)
         if not os.path.isfile(csv_path):
             messagebox.showinfo("统计图表", "暂无统计数据，请先运行脚本。", parent=self)
             return
@@ -1326,7 +1331,7 @@ class Application(ttkb.Window):
 
         f_switch = ttkb.Frame(body)
         f_switch.pack(fill=X, pady=5)
-        ttkb.Label(f_switch, text="无任务切换间隔随机范围(s):").pack(side=LEFT)
+        ttkb.Label(f_switch, text="无任务来回切换间隔随机范围(s):").pack(side=LEFT)
         e_switch_min = ttkb.Entry(f_switch, width=5)
         e_switch_min.pack(side=LEFT, padx=5)
         e_switch_min.insert(0, str(self.config.get("filter_switch_min", 5)))
@@ -1342,13 +1347,13 @@ class Application(ttkb.Window):
         ttkb.Label(f_logout, text="小退间隔随机范围(分钟):").pack(side=LEFT)
         e_logout_min = ttkb.Entry(f_logout, width=5)
         e_logout_min.pack(side=LEFT, padx=5)
-        e_logout_min.insert(0, str(self.config.get("no_takeoff_logout_min", 20)))
+        e_logout_min.insert(0, str(self.config.get("no_takeoff_logout_min", 30)))
         ttkb.Label(f_logout, text="-").pack(side=LEFT)
         e_logout_max = ttkb.Entry(f_logout, width=5)
         e_logout_max.pack(side=LEFT, padx=5)
-        e_logout_max.insert(0, str(self.config.get("no_takeoff_logout_max", 30)))
+        e_logout_max.insert(0, str(self.config.get("no_takeoff_logout_max", 40)))
         self.create_info_icon(f_logout,
-                              "不起飞模式开启后，每隔该随机时长执行一次小退，清空起飞飞机\n（点击左上角菜单->更改机场->开始->等待返回主界面）。\n填 0-0 表示关闭自动小退。单位：分钟。").pack(side=LEFT, padx=5)
+                              "不起飞模式开启后，每隔该随机时长执行一次小退，清空起飞飞机\n（点击左上角菜单->更改机场->开始->等待返回主界面）。\n填 0-0 表示关闭自动小退。单位：分钟，最大 120 分钟。\n默认 30-40 分钟。").pack(side=LEFT, padx=5)
 
         ttkb.Separator(body).pack(fill=X, pady=10)
         ttkb.Label(body, text="防检测设置", font=("bold")).pack(anchor="w")
@@ -1432,7 +1437,7 @@ class Application(ttkb.Window):
                 lo_min = float(e_logout_min.get().strip())
                 lo_max = float(e_logout_max.get().strip())
                 lo_min = max(0, lo_min)
-                lo_max = max(0, lo_max)
+                lo_max = max(0, min(120, lo_max))
                 if lo_max < lo_min: lo_max = lo_min
             except (ValueError, AttributeError):
                 lo_min, lo_max = 0, 0
@@ -1441,7 +1446,7 @@ class Application(ttkb.Window):
             try:
                 sw_min = float(e_switch_min.get())
                 sw_max = float(e_switch_max.get())
-                if sw_min < 0.5: sw_min = 0.5
+                if sw_min < 1: sw_min = 1
                 if sw_max > 60: sw_max = 60
                 if sw_max < sw_min: sw_max = sw_min
                 self.config["filter_switch_min"] = sw_min
@@ -1471,10 +1476,10 @@ class Application(ttkb.Window):
                 changed.append(("塔台关闭筛选全部飞机", "开" if self.config.get("cancel_stand_filter") else "关"))
             if (old_cfg.get("no_takeoff_logout_min") != self.config.get("no_takeoff_logout_min") or
                     old_cfg.get("no_takeoff_logout_max") != self.config.get("no_takeoff_logout_max")):
-                changed.append(("小退间隔随机范围", f"{self.config.get('no_takeoff_logout_min', 20)}-{self.config.get('no_takeoff_logout_max', 30)} 分钟"))
+                changed.append(("小退间隔随机范围", f"{self.config.get('no_takeoff_logout_min', 30)}-{self.config.get('no_takeoff_logout_max', 40)} 分钟"))
             if (old_cfg.get("filter_switch_min") != self.config.get("filter_switch_min") or
                     old_cfg.get("filter_switch_max") != self.config.get("filter_switch_max")):
-                changed.append(("无任务切换间隔随机范围", f"{self.config.get('filter_switch_min', 5)}-{self.config.get('filter_switch_max', 10)} 秒"))
+                changed.append(("无任务来回切换间隔随机范围", f"{self.config.get('filter_switch_min', 5)}-{self.config.get('filter_switch_max', 10)} 秒"))
 
             anti_changed = (
                 old_cfg.get("slide_min") != self.config.get("slide_min") or
@@ -1606,7 +1611,7 @@ class Application(ttkb.Window):
             self.bot.set_thinking_time_mode(self.config.get("thinking_mode", 0), log_change=not no_log)
             self.bot.set_no_takeoff_mode(self.var_no_takeoff_mode.get())
             self.bot.set_no_takeoff_logout_interval(
-                self.config.get("no_takeoff_logout_min", 20), self.config.get("no_takeoff_logout_max", 30))
+                self.config.get("no_takeoff_logout_min", 30), self.config.get("no_takeoff_logout_max", 40))
             self.bot.set_filter_switch_interval(
                 self.config.get("filter_switch_min", 5), self.config.get("filter_switch_max", 10))
             self.bot.set_cancel_stand_filter_when_tower_off(self.var_cancel_stand_filter.get())
