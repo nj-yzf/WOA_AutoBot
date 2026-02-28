@@ -86,7 +86,7 @@ if INSTANCE_ID is None:
 CONFIG_FILE = "config.json" if INSTANCE_ID == 1 else f"config_{INSTANCE_ID}.json"
 STATS_FILE = "woa_stats.csv"
 
-LOCAL_VERSION = "v1.2.6"
+LOCAL_VERSION = "v1.2.6.1"
 _GITEE_RAW_URL = "https://gitee.com/shuang-nagi/WOA_AutoBot/raw/master/{}"
 _GITEE_API_URL = "https://gitee.com/api/v5/repos/shuang-nagi/WOA_AutoBot/contents/{}?ref=master"
 _GITEE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -379,7 +379,7 @@ class TeeToFile:
 class Application(ttkb.Window):
     def __init__(self):
         try:
-            myappid = 'woabot.launcher.v1.2.6'
+            myappid = 'woabot.launcher.v1.2.6.1'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except:
             pass
@@ -391,7 +391,7 @@ class Application(ttkb.Window):
         self.style.colors.primary = "#89b0ae"
         self.style.colors.info = "#9cbfdd"
 
-        self.title(f"WOA AutoBot v1.2.6" + (f" [实例 {INSTANCE_ID}]" if INSTANCE_ID > 1 else ""))
+        self.title(f"WOA AutoBot v1.2.6.1" + (f" [实例 {INSTANCE_ID}]" if INSTANCE_ID > 1 else ""))
         self.geometry("680x850")
         self.last_geometry = "680x850"
         self.is_mini_mode = False

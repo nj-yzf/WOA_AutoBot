@@ -66,7 +66,7 @@ class WoaBot:
         self.REGION_MAIN_ANCHOR = (30, 30, 55, 45)
         self.REGION_REWARD_RECOVERY = (308, 428, 1007, 311)
         self.REWARD_FLOW_BUTTONS = ['get_award_1.png', 'get_award_2.png', 'get_award_3.png', 'get_award_4.png',
-                                    'push_back.png', 'taxi_to_runway.png', 'start_general.png']
+                                    'push_back.png', 'taxi_to_runway.png', 'start_general.png', 'error_ok.png']
         self.last_seen_main_interface_time = time.time()
         self.STUCK_TIMEOUT = 15.0
         self.auto_delay_count = 0
@@ -409,7 +409,7 @@ class WoaBot:
 
         # 2. 中间领奖区防卡死：不论是否在主界面，均遍历寻找领奖按钮并点击直至恢复正常
         rx, ry, rw, rh = self.REGION_REWARD_RECOVERY
-        for _ in range(10):
+        for _ in range(6):
             screen = self.adb.get_screenshot()
             if screen is None:
                 break
@@ -1733,7 +1733,8 @@ class WoaBot:
                 else:
                     self.log("   -> 未找到购买按钮")
             else:
-                self.log("   -> 🚨 发现车辆不足，忽略")
+                self.log("   -> ⚠️ 发现车辆不足，未开启自动购买，10s 内跳过所有任务")
+                self._vehicle_shortage_cooldown_until = time.time() + 10
             self.close_window()
             return True
         screen = self.adb.get_screenshot()
@@ -1745,12 +1746,18 @@ class WoaBot:
             if res_done:
                 self.log("   -> 🕒 发现延误/完成飞机")
                 if self.enable_delay_bribe:
-                    agent_loc = self.safe_locate('stand_agent_false.png')
+                    agent_loc = self.safe_locate('delayed_flight_false.png')
                     if agent_loc:
-                        self.log("   -> [贿赂] 点击服务代理...")
+                        self.log("   -> [贿赂] 点击延误贿赂按钮...")
                         self.adb.click(agent_loc[0], agent_loc[1])
-                        if self.wait_and_click('stand_agent_true.png', timeout=2.0, click_wait=0):
-                            self.log("   -> [贿赂] 代理已激活")
+                        self.sleep(0.5)
+                        for _ in range(5):
+                            if self.safe_locate('delayed_flight_true.png', confidence=0.85):
+                                self.log("   -> [贿赂] 延误贿赂已激活")
+                                break
+                            self.sleep(0.3)
+                        else:
+                            self.log("   -> [贿赂] ⚠️ 未确认激活状态")
                 self.adb.click(res_done[0] + bx, res_done[1] + by)
                 self.log("   -> ✅ 点击结束服务")
                 self.sleep(0.5)
@@ -1907,68 +1914,84 @@ class WoaBot:
     def handle_stand_task(self, target_pos=None):
         self.sleep(0.1)
         if not self._verify_and_redirect('status_stand.png'): return True
+        if time.time() < getattr(self, '_stand_blind_fail_cooldown_until', 0):
+            self.log("   -> ⏳ 盲做失败冷却中，跳过停机位任务")
+            self.close_window()
+            return False
         self.log(">>> [任务] 处理停机位队列...")
+        # 保存进入前的地勤状态，未确认分配时恢复，防止滑动导致的临时变化被监控器误读
+        _saved_staff = self.last_checked_avail_staff
+        _confirmed = False
         _stand_deadline = time.time() + 30.0
         while time.time() < _stand_deadline:
             self._check_running()
+            # 第一步：检测绿点，确认任务可操作
+            if not self.safe_locate('green_dot.png', region=self.REGION_GREEN_DOT):
+                self.log("   -> ⚠️ 未检测到绿点，跳过")
+                self.close_window()
+                if not _confirmed:
+                    self.last_checked_avail_staff = _saved_staff
+                return False
+
+            # 第二步：读取可用地勤
             avail_staff = None
-            is_read_success = False
             for _ in range(3):
                 val = self.check_global_staff()
                 if val is not None and val < 900:
                     avail_staff = val
-                    is_read_success = True
-                    self._update_staff_tracker(val)
                     break
                 self.sleep(0.2)
             if avail_staff is None:
                 self.log("⚠️ 无法读取地勤人数，尝试盲做")
-                self._update_staff_tracker(None)
                 avail_staff = 999
-                is_read_success = False
+
+            # 第三步：读取花费
             cost_text = self.ocr.recognize_number(self.REGION_TASK_COST, mode='task')
             required_cost = self.ocr.parse_cost(cost_text)
             self._stat_last_required_cost = required_cost
+
             if required_cost is None:
                 self.log(f"⚠️ 读取花费失败，盲做")
-                if self._perform_stand_action_sequence(force_verify=not is_read_success):
+                if self._perform_stand_action_sequence():
                     self.log("   -> 盲做成功")
+                    _confirmed = True
                     self.stand_skip_index = 0
                     self.doing_task_forbidden_until = time.time() + 6.0
                     self.next_list_refresh_time = time.time() + 6.0
                     return True
                 else:
+                    self.last_checked_avail_staff = _saved_staff
                     if self.in_staff_shortage_mode:
                         self.log("🛑 盲做触发人员不足")
+                        self._stand_blind_fail_cooldown_until = time.time() + 20
                         self.close_window()
                         if self._try_get_bonus_staff():
                             self.stand_skip_index = 0
                             return True
                     self.stand_skip_index += 1
                     return False
+
             self.log(f"   -> 需求: {required_cost}+1 | 可用: {avail_staff}")
 
             if avail_staff >= (required_cost + 1):
-                if self.safe_locate('green_dot.png', region=self.REGION_GREEN_DOT):
-                    self.log("   -> ✅ 地勤人员充足，开始分配")
-                    if self._perform_stand_action_sequence(force_verify=not is_read_success):
-                        self.log("   -> 地勤保障开始成功")
-                        self.stand_skip_index = 0
-                        self.doing_task_forbidden_until = time.time() + 6.0
-                        self.next_list_refresh_time = time.time() + 6.0
-                        return True
-                    else:
-                        if not self.in_staff_shortage_mode:
-                            self.log("   -> 操作未成功，跳过本架")
-                            self.stand_skip_index += 1
-                            return False
+                self.log("   -> ✅ 地勤人员充足，开始分配")
+                if self._perform_stand_action_sequence():
+                    self.log("   -> 地勤保障开始成功")
+                    _confirmed = True
+                    self.stand_skip_index = 0
+                    self.doing_task_forbidden_until = time.time() + 6.0
+                    self.next_list_refresh_time = time.time() + 6.0
+                    return True
                 else:
-                    self.log("   -> ⚠️ 人员充足但未检测到绿点，跳过")
-                    self.close_window()
-                    return False
+                    self.last_checked_avail_staff = _saved_staff
+                    if not self.in_staff_shortage_mode:
+                        self.log("   -> 操作未成功，跳过本架")
+                        self.stand_skip_index += 1
+                        return False
 
             self.log(f"🛑 人力不足 (缺 {required_cost + 1 - avail_staff})")
             self.close_window()
+            self.last_checked_avail_staff = _saved_staff
             if self._try_get_bonus_staff():
                 self.log("   -> 领取成功，重试")
                 self.stand_skip_index = 0
@@ -2053,7 +2076,7 @@ class WoaBot:
         self.next_bonus_retry_time = time.time() + (15 * 60)
         return False
 
-    def _perform_stand_action_sequence(self, force_verify=False):
+    def _perform_stand_action_sequence(self):
         if self.slide_min_duration >= self.slide_max_duration:
             rand_duration = self.slide_min_duration
         else:
@@ -2080,37 +2103,31 @@ class WoaBot:
             self.close_window()
             return False
 
-        should_skip = self.enable_skip_staff and (not force_verify)
-        if should_skip:
-            self.log("   -> [极速] 跳过地勤验证")
+        self.sleep(0.2)
+        check_x, check_y = 63, 546
+        b, g, r = self.adb.get_pixel_color(check_x, check_y)
+        target_b, target_g, target_r = 153, 220, 96
+        diff = abs(b - target_b) + abs(g - target_g) + abs(r - target_r)
+        is_green = diff < 100
+
+        if is_green:
+            self.log("   -> [颜色检测] ✅ 通过")
         else:
-            if self.enable_skip_staff and force_verify:
-                self.log("   -> [安全] 地勤人数未知，强制执行验证")
-            self.sleep(0.2)
-            check_x, check_y = 63, 546
-            b, g, r = self.adb.get_pixel_color(check_x, check_y)
-            target_b, target_g, target_r = 153, 220, 96
-            diff = abs(b - target_b) + abs(g - target_g) + abs(r - target_r)
-            is_green = diff < 100
+            self.log(f"   -> [颜色检测] ❌ 失败 (diff={diff})")
 
-            if is_green:
-                self.log("   -> [颜色检测] ✅ 通过")
-            else:
-                self.log(f"   -> [颜色检测] ❌ 失败 (diff={diff})")
-
-            is_success_icon = self.safe_locate('stand_agent_true.png', confidence=0.85)
-            if is_success_icon:
-                self.log("   -> [图标检测] ✅ 通过")
-            else:
-                self.log("   -> [图标检测] ❌ 失败")
-            if not (is_green and is_success_icon):
-                self.log("🛑 验证失败：颜色或图标未通过")
-                if self.safe_locate('insufficient_ground_staff.png', confidence=0.7):
-                    self.log("   -> 原因：发现了人员不足警告")
-                    self.in_staff_shortage_mode = True
-                    self.last_known_available_staff = 0
-                self.close_window()
-                return False
+        is_success_icon = self.safe_locate('stand_agent_true.png', confidence=0.85)
+        if is_success_icon:
+            self.log("   -> [图标检测] ✅ 通过")
+        else:
+            self.log("   -> [图标检测] ❌ 失败")
+        if not (is_green and is_success_icon):
+            self.log("🛑 验证失败：颜色或图标未通过")
+            if self.safe_locate('insufficient_ground_staff.png', confidence=0.7):
+                self.log("   -> 原因：发现了人员不足警告")
+                self.in_staff_shortage_mode = True
+                self.last_known_available_staff = 0
+            self.close_window()
+            return False
 
         if self.wait_and_click('start_ground_support.png', timeout=2.0, click_wait=0):
             self._stat_stand_count += 1
@@ -2207,7 +2224,7 @@ class WoaBot:
             current_avail = staff_this_round if staff_this_round is not None else self.check_global_staff(screen_image=current_screen)
             if current_avail is not None:
                 is_blind_recovery = (prev_staff >= 900) and (current_avail < 900)
-                is_changed = (prev_staff != -1) and (current_avail != prev_staff)
+                is_changed = (prev_staff not in (-1, 999)) and (current_avail > prev_staff)
                 is_zero_recovery = (prev_staff == 0) and (current_avail > 0)
                 is_safe_amount = current_avail >= 15
                 if is_safe_amount or is_changed or is_blind_recovery or is_zero_recovery:
@@ -2229,6 +2246,10 @@ class WoaBot:
         status_roi = current_screen[sy:sy + sh, sx:sx + sw]
         raw_detections, final_tasks = self._run_pending_detection(list_roi_img)
         # 注意：运行过程中不再与 ADB 校验后自动回退，仅在启动时通过截图方案测试和回退链确定方案
+
+        # 车辆不足冷却期内跳过所有任务
+        if time.time() < getattr(self, '_vehicle_shortage_cooldown_until', 0):
+            return False
 
         doing_tasks = [d for d in final_tasks if d['type'] == 'doing']
         for det in doing_tasks:
