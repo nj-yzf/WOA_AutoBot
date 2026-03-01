@@ -311,17 +311,25 @@ class AdbController:
         if not for_control and self.screenshot_method != "uiautomator2" and not allow_screenshot_fallback:
             return False
         try:
-            # lxml 是 u2 的依赖但本项目不使用 XML 解析功能，Nuitka 打包可能漏掉
+            # lxml 是 u2 的依赖但本项目不使用 XML 解析功能，Nuitka 打包可能漏掉或破坏 C 扩展
+            _lxml_ok = False
             try:
-                import lxml  # noqa: F401
-            except ImportError:
+                import lxml.etree
+                # Nuitka 可能编译 lxml 但破坏内部 C 类（如 _Element），需检测
+                if hasattr(lxml.etree, '_Element'):
+                    _lxml_ok = True
+            except (ImportError, AttributeError):
+                pass
+            if not _lxml_ok:
                 import types
                 _mock_lxml = types.ModuleType("lxml")
                 _mock_etree = types.ModuleType("lxml.etree")
+                # 提供 _Element 占位，防止 u2 内部 isinstance 检查报错
+                _mock_etree._Element = type("_Element", (), {})
                 _mock_lxml.etree = _mock_etree
-                import sys
-                sys.modules["lxml"] = _mock_lxml
-                sys.modules["lxml.etree"] = _mock_etree
+                import sys as _sys
+                _sys.modules["lxml"] = _mock_lxml
+                _sys.modules["lxml.etree"] = _mock_etree
             import uiautomator2 as u2  # type: ignore[import-untyped]
             self._u2_ensure_assets(u2)
             # 参考 ALAS：模拟器使用 connect_usb（走 ADB 通道），物理设备使用 connect

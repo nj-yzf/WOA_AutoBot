@@ -60,14 +60,34 @@ MAX_INSTANCES = 3
 # === 多实例支持 ===
 def _acquire_instance():
     """自动获取可用的实例槽位 (1~MAX_INSTANCES)，通过文件锁防止冲突。"""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(sys.executable)
     for i in range(1, MAX_INSTANCES + 1):
-        lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"instance_{i}.lock")
+        lock_path = os.path.join(base_dir, f"instance_{i}.lock")
         try:
             fh = open(lock_path, "w")
             fh.write(str(i))
             fh.flush()
             fh.seek(0)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            # 启动成功，顺便清理其他无主 lock 文件
+            for j in range(1, MAX_INSTANCES + 1):
+                if j == i:
+                    continue
+                other_lock = os.path.join(base_dir, f"instance_{j}.lock")
+                if not os.path.exists(other_lock):
+                    continue
+                try:
+                    tmp = open(other_lock, "w")
+                    msvcrt.locking(tmp.fileno(), msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(tmp.fileno(), msvcrt.LK_UNLCK, 1)
+                    tmp.close()
+                    os.remove(other_lock)
+                except (OSError, IOError):
+                    pass  # 被其他实例持有，跳过
+                except Exception:
+                    pass
             return i, fh
         except (OSError, IOError):
             try:
@@ -685,12 +705,12 @@ class Application(ttkb.Window):
         f_no_takeoff.pack(side=LEFT, padx=(0, _row1_gap), pady=8)
         ttkb.Checkbutton(f_no_takeoff, text="不起飞模式", variable=self.var_no_takeoff_mode,
                          bootstyle="success-round-toggle", command=self.sync_all_configs_to_bot).pack(side=LEFT)
-        self.create_info_icon(f_no_takeoff, "请配合塔台中Ground控制器使用，以完成推出操作。\n开启后，脚本会控制筛选状态在起飞和停机位两档间轮流切换：\n单档最多待15秒、无可用任务时切换、若仍无任务则来回切换以寻找任务。\n并且可以自动点击更改机场再重进以清空起飞飞机。\n此功能开启后，自动延时塔台将只会延时Ground控制器。").pack(side=LEFT, padx=5)
+        self.create_info_icon(f_no_takeoff, "请配合塔台中Ground控制器使用，以完成推出操作。\n开启后，脚本会控制筛选状态在起飞和停机位两档间轮流切换：\n单档最多待15秒、无可用任务时切换、若仍无任务则来回切换以寻找任务。\n并且可以自动点击更改机场再重进以清空起飞飞机。").pack(side=LEFT, padx=5)
         f_tower_off = ttkb.Frame(f_row1)
         f_tower_off.pack(side=LEFT, padx=(0, _row1_gap), pady=8)
         ttkb.Checkbutton(f_tower_off, text="塔台关闭筛选全部", variable=self.var_cancel_stand_filter,
                          bootstyle="success-round-toggle", command=self.sync_all_configs_to_bot).pack(side=LEFT)
-        self.create_info_icon(f_tower_off, "开启后，塔台关闭时，脚本会强制取消停机位飞机的筛选，处理全部的待处理飞机。").pack(side=LEFT, padx=5)
+        self.create_info_icon(f_tower_off, "开启后，塔台到期时，脚本会取消停机位飞机的筛选，处理全部的待处理飞机。").pack(side=LEFT, padx=5)
         f_tower = ttkb.Frame(f_row1)
         f_tower.pack(side=LEFT, padx=(_row1_gap-8, 0), pady=8)
         ttkb.Label(f_tower, text="自动延时塔台:").pack(side=LEFT)
@@ -699,7 +719,7 @@ class Application(ttkb.Window):
         ttkb.Button(f_tower, text="确认", bootstyle="outline-success", width=4, padding=0,
                     command=self.on_confirm_tower_delay).pack(side=LEFT, padx=5)
         self.create_info_icon(f_tower,
-                              "填0表示功能关闭，最大值144；\n使用前请手动开启塔台，并设置好延时界面中各项配置；\n支持延时你开启的一个或多个控制器\n你设置的延时时间是多久，脚本一次就延时多久\n你开启哪些控制器，脚本就延时哪些控制器，脚本不会主动修改。\n（实验性功能）").pack(
+                              "填0表示功能关闭，最大值144，成功延时1次，次数减1；\n使用前请手动开启塔台，并设置好延时界面中各项配置；\n支持延时部分控制器，脚本可以自动识别并仅延时开启的控制器\n设置的延时时间是多久，脚本一次就延时多久，脚本不会主动修改。").pack(
             side=LEFT)
 
         ctl_frame = ttkb.Frame(self.container_main, padding=main_pad)
@@ -786,11 +806,12 @@ class Application(ttkb.Window):
 - 脚本尚不稳定，如果造成账号内游戏币损失，本人概不负责！使用辅助工具有风险，请自行评估，如造成账号封禁，与作者无关！
 
 【环境配置】
-1. 仅支持在Windows系统上使用的安卓模拟器，本脚本专为MuMu模拟器优化，强烈推荐使用MuMu模拟器，模拟器分辨率必须设置为 1600x900。
-2. Mumu模拟器默认地址为127.0.0.1:16384（其他模拟器或多开，请到模拟器设置内查看），并且自备加速器，保证网络通畅。
-3. 请优先连接127.0.0.1:16384，127.0.0.1:16416之类的端口，尽量不要连接127.0.0.1:5555，emulator-5554之类的端口。
-4. 使用MuMu模拟器时，请在设备设置中关闭“网络桥接模式”，关闭“后台挂机时保活运行”选项。
-5. - 如模拟器连接遇到问题，请首先尝试手动指定ADB路径。
+1. 请尽量将脚本文件夹放在纯英文路径运行。
+2. 仅支持在Windows系统上使用的安卓模拟器，本脚本专为MuMu模拟器优化，强烈推荐使用MuMu模拟器，模拟器分辨率必须设置为 1600x900。
+3. Mumu模拟器默认地址为127.0.0.1:16384（其他模拟器或多开，请到模拟器设置内查看），并且自备加速器，保证网络通畅。
+4. 请优先连接127.0.0.1:16384，127.0.0.1:16416之类的端口，尽量不要连接127.0.0.1:5555，emulator-5554之类的端口。
+5. 使用MuMu模拟器时，请在设备设置中关闭“网络桥接模式”，关闭“后台挂机时保活运行”选项。
+6. - 如模拟器连接遇到问题，请首先尝试手动指定ADB路径。
    - 如nemu_ipc方案无法启用，请首先尝试手动指定MuMu安装路径（指定到例如D:\Program Files\MuMuPlayer即可，不要指定到MuMuPlayer\nx_main文件夹）。
    - 如遇到未知问题，请尝试切换模拟器渲染模式为DirectX。
 
@@ -801,13 +822,16 @@ class Application(ttkb.Window):
 4. 机位分配只会点第一个，如果不希望C型机停DEF的机位等情况，需要手动筛选机位停机类型，并且与时刻表功能不兼容，请把时刻表重置。
 
 【功能说明】
-1. 推荐使用nemu_ipc + minitouch（默认，Mumu专用，且不支持Mumu国际版）或uiautomator2 + minitouch的方案。脚本运行速度主要取决于[截图方案]，运行速度如下：nemu_ipc > uiautomator2 >> droidcast_raw >= ADB。
-2. 使用高速方案（如nemu_ipc或uiautomator2）时，由于速度很快，出错会增多，非常不建议关闭“跳过二次校验”和“跳过地勤分配验证”开关。 
+1. 推荐使用nemu_ipc + minitouch（默认，Mumu专用，且不支持Mumu国际版）或uiautomator2 + minitouch的方案。脚本运行速度主要取决于[截图方案]
+    运行速度如下：nemu_ipc > uiautomator2 >> droidcast_raw >= ADB。
+2. 使用高速方案（nemu_ipc和uiautomator2）时，由于速度快，出错会增多，非常不建议开启“跳过二次校验”和“跳过地勤分配验证”开关。 
 3. 脚本运行时必须保持游戏右侧筛选选项中，仅筛选出带有黄色感叹号的待处理飞机。但您无需担心！脚本可以自动检测并调整筛选状态。
-4. 使用“自动延时塔台”功能前，请保证您已开启塔台（且目前仅支持四个控制器全开），并设置好带有[延时]按钮的界面，脚本不会主动调整。
+4. v1.2.6版本中，“自动延时塔台”功能通过打开塔台菜单后，OCR读取的倒计时结果触发，剩余3min时进行延时操作。支持延时任意的一个或多个控制器，自动识别开启的控制器，你开启了哪几个，就延时哪几个。
+5. 统计功能说明：只有点击允许降落时，才计入进场飞机。点击推出时才计入离场飞机。
+    统计数据都保存在本地，在根目录woa_stats.csv文件中，版本更新时暂时需要手动移动该文件以免统计数据丢失。
 
 【已知问题和缺陷】
-1. 脚本本身支持多开，但测试并不充分，多开很可能存在未知问题。若脚本正在运行时，开启（或关闭）第二个脚本或类似软件（如ALAS），会导致脚本运行中断，请注意，尝试停止后再重新运行。
+1. 脚本支持多开，再次点击exe即可打开第二个实例，但测试并不充分，多开很可能存在未知问题。若脚本正在运行时，开启（或关闭）第二个脚本或类似软件（如ALAS），可能会导致脚本运行中断，请注意。
 2. 脚本很有可能被杀毒软件误杀，如您遇到类似问题，请关闭杀毒软件。
 3. 脚本处理[需要维护]的飞机时，暂无法应对绿币不足的情况，请您根据机队规模，预留充足的绿币。
 4. 任何情况下脚本目前都没有滑动右侧任务列表的能力。
@@ -1353,7 +1377,7 @@ class Application(ttkb.Window):
         e_logout_max.pack(side=LEFT, padx=5)
         e_logout_max.insert(0, str(self.config.get("no_takeoff_logout_max", 40)))
         self.create_info_icon(f_logout,
-                              "不起飞模式开启后，每隔该随机时长执行一次小退，清空起飞飞机\n（点击左上角菜单->更改机场->开始->等待返回主界面）。\n填 0-0 表示关闭自动小退。单位：分钟，最大 120 分钟。\n默认 30-40 分钟。").pack(side=LEFT, padx=5)
+                              "不起飞模式开启后，每隔该随机时长执行一次小退，清空起飞飞机\n（点击左上角菜单->更改机场->开始->等待返回主界面）。\n填 0-0 表示关闭自动小退。单位：分钟，最大 120 分钟。\n默认 30-40 分钟。\n注意：每次启动脚本，下次小退计划时间会被重置").pack(side=LEFT, padx=5)
 
         ttkb.Separator(body).pack(fill=X, pady=10)
         ttkb.Label(body, text="防检测设置", font=("bold")).pack(anchor="w")

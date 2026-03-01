@@ -351,6 +351,8 @@ class WoaBot:
             self._check_running()
             if self.safe_locate('main_interface.png', region=self.REGION_MAIN_ANCHOR, confidence=0.8):
                 self.log("📋 [小退] 已返回主界面，恢复处理")
+                self.adb.click(1160, 41)
+                self.sleep(0.5)
                 return
             self.sleep(1.0)
         self.log("📋 [小退] 90s 内未检测到主界面，交由后续流程处理")
@@ -1048,6 +1050,7 @@ class WoaBot:
         self._periodic_15s_check(force_initial_filter_check=True)
         if self.enable_no_takeoff_mode and self._no_takeoff_logout_max > 0:
             self._no_takeoff_logout_next_time = time.time() + random.uniform(self._no_takeoff_logout_min, self._no_takeoff_logout_max) * 60
+            self.log(f"📋 [小退] 下次小退时间: {time.strftime('%H:%M:%S', time.localtime(self._no_takeoff_logout_next_time))}")
         # 启动时读取塔台倒计时
         try:
             self._init_tower_countdown()
@@ -1074,8 +1077,9 @@ class WoaBot:
                 if getattr(self, '_request_apply_mode3', False):
                     self._request_apply_mode3 = False
                     self._periodic_15s_check(force_initial_filter_check=True)
-                    if self.enable_no_takeoff_mode and self._no_takeoff_logout_max > 0:
+                    if self.enable_no_takeoff_mode and self._no_takeoff_logout_max > 0 and self._no_takeoff_logout_next_time <= 0:
                         self._no_takeoff_logout_next_time = time.time() + random.uniform(self._no_takeoff_logout_min, self._no_takeoff_logout_max) * 60
+                        self.log(f"📋 [小退] 下次小退时间: {time.strftime('%H:%M:%S', time.localtime(self._no_takeoff_logout_next_time))}")
                 if getattr(self, '_request_switch_mode1', False):
                     self._request_switch_mode1 = False
                     self._force_switch_filter_mode1()
@@ -1083,6 +1087,7 @@ class WoaBot:
                     self.log("📋 [小退] 到达小退间隔，执行小退...")
                     self._do_no_takeoff_small_logout()
                     self._no_takeoff_logout_next_time = time.time() + random.uniform(self._no_takeoff_logout_min, self._no_takeoff_logout_max) * 60
+                    self.log(f"📋 [小退] 下次小退时间: {time.strftime('%H:%M:%S', time.localtime(self._no_takeoff_logout_next_time))}")
                 # 检查塔台倒计时是否到期
                 if self._check_tower_countdown():
                     idle_count = 0
@@ -1430,7 +1435,7 @@ class WoaBot:
             if urgent:
                 urgent_slots = [i+1 for i in range(4) if needs_delay_now[i]]
                 self.log(f"🗼 [塔台] ⚠️ 控制器 {urgent_slots} 剩余不足3分钟，立即执行延时！")
-                self._perform_tower_delay(needs_delay_now, menu_already_open=True)
+                self._perform_tower_delay(needs_delay_now, menu_already_open=True, pre_times=times)
                 return
             # 自动延时已开启：提前3分钟触发
             trigger_in = max(0, min_time - 180)
@@ -1520,7 +1525,7 @@ class WoaBot:
             return True
         # 菜单已打开，直接执行延时（不关菜单）
         self.log(f"🗼 [塔台] 需要延时的控制器: {[i+1 for i in range(4) if needs_delay[i]]}")
-        self._perform_tower_delay(needs_delay, menu_already_open=True)
+        self._perform_tower_delay(needs_delay, menu_already_open=True, pre_times=times)
         return True
 
     def _try_delay_clicks(self, needs_delay, all_active, all_need):
@@ -1578,9 +1583,10 @@ class WoaBot:
                 return True
         return False
 
-    def _perform_tower_delay(self, needs_delay, menu_already_open=False):
+    def _perform_tower_delay(self, needs_delay, menu_already_open=False, pre_times=None):
         """执行塔台延时操作。needs_delay: [bool]*4 表示哪些控制器需要延时。
         menu_already_open=True 时假设菜单已打开。
+        pre_times: 调用方已读取的 OCR 时间，传入则跳过重复读取。
         失败时重试：关窗重点按钮(最多2次) → 关窗+back退回主界面+重开菜单(1次)
         每次尝试后通过 OCR 对比时间变化，防止误判导致重复延时。"""
         delay_slots = [i+1 for i in range(4) if needs_delay[i]]
@@ -1593,7 +1599,8 @@ class WoaBot:
                 self._tower_delay_deadline = time.time() + 30
                 return True
         # 记录延时前的 OCR 时间，用于后续对比
-        pre_times = self._read_tower_times(open_menu=False)
+        if pre_times is None:
+            pre_times = self._read_tower_times(open_menu=False)
         self.log(f"🗼 [塔台] 延时前 OCR 时间: {pre_times}")
         all_active = all(self._tower_active_slots)
         all_need = all(n for n, a in zip(needs_delay, self._tower_active_slots) if a)
