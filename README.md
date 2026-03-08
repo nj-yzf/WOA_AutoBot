@@ -9,7 +9,7 @@ WOA AutoBot 是一款专为《World of Airports》世界机场游戏开发的自
 
 本软件的代码遵循 GPL-3.0 协议，您可以自由修改和分发代码。
 
-但是， 衍生版本请使用独立版本号，请勿直接沿用原版版本号（如 v1.2.7），或使用如 v1.2.7-modified-by-您的昵称 的形式。
+但是， 衍生版本请使用独立版本号，请勿直接沿用原版版本号（如 v1.2.7），可使用如 v1.2.7-modified-by-您的昵称 的形式。
 
 ## 🤝 致谢
 本项目在开发过程中，模拟器连接与控制部分的逻辑设计大量参考了 [ALAS (AzurLaneAutoScript)](https://github.com/LmeSzinc/AzurLaneAutoScript)。
